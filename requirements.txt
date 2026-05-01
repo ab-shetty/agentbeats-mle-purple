@@ -1,0 +1,17 @@
+a2a-sdk[http-server]>=0.3.20,<1.0
+openai>=1.50.0
+httpx>=0.28.1
+pydantic>=2.11.0
+uvicorn>=0.38.0
+python-dotenv>=1.1.1
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+lightgbm>=4.3.0
+xgboost>=2.0.0
+# CV / NLP stack (CPU-only torch installed separately in Dockerfile from
+# pytorch CPU wheel index to keep the image small).
+timm>=1.0.0
+transformers>=4.40.0
+pillow>=10.0.0
+opencv-python-headless>=4.9.0
