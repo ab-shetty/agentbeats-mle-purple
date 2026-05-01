@@ -16,14 +16,18 @@ torch/torchvision/timm (image) + transformers (text). CPU-only execution.
 """
 from __future__ import annotations
 
+import csv
 import json
 import logging
 import os
 import re
 import subprocess
 import sys
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 from . import openai_client
 
@@ -51,9 +55,11 @@ Output a JSON object (and ONLY a JSON object, no prose) with these keys:
                      "train/<class>/*.jpg + test/*.jpg, label encoded by folder")
   feature_notes:    short bullet list of feature-engineering ideas specific to this dataset
   model_plan:       short bullet list of model approaches in priority order, with
-                    rough wall-clock guesses (CPU only, total budget 30 min)
+                    rough wall-clock guesses (CPU only, using the provided execution budget)
 
-Be concise. Be correct about column names, metric direction, and modality."""
+Be concise. Be correct about column names, metric direction, modality, and
+the actual observed file layout. If image roots are nested, use the detected
+paths instead of assuming files live directly under train/ or test/."""
 
 
 SYSTEM_PROMPT_CODER = """You are a senior Kaggle Grandmaster writing a single self-contained Python script that solves an MLE-bench competition.
@@ -61,12 +67,14 @@ SYSTEM_PROMPT_CODER = """You are a senior Kaggle Grandmaster writing a single se
 GENERAL CONSTRAINTS:
   - Output ONLY a Python code block delimited by ```python ... ``` and nothing else.
   - Read data from os.environ['DATA_DIR']. Write predictions to os.environ['OUTPUT_PATH'].
+  - Use the provided dataset profile and actual observed paths. Do not hard-code
+    competition names or assume generic train/test roots if the files are nested.
   - Output CSV MUST exactly match the schema (column names + ordering) of sample_submission.csv
     and contain a row for every test row, in the same order as sample_submission.csv when possible.
   - Print a short summary line "CV score: <number>" if you compute cross-validation.
   - Wrap the script in `if __name__ == "__main__": main()` style.
-  - Execution is CPU-only. Total wall-clock budget: ~30 minutes (subprocess timeout enforced).
-    Plan training to finish in ~20 min and leave time for inference + writing the CSV.
+  - Execution is CPU-only. Respect the provided subprocess timeout budget.
+    Plan training to finish well inside that budget and leave time for inference + writing the CSV.
   - If the previous attempt produced an error or invalid submission, fix the root cause —
     do not just paper over with try/except.
 
@@ -97,10 +105,17 @@ TEXT (e.g. jigsaw-toxic-comment-classification):
     with TF-IDF then).
 
 IMAGE (e.g. aerial-cactus, dogs-vs-cats, denoising-dirty-documents, whale):
+  - Resolve train/test image roots dynamically from the observed dataset profile
+    or by searching under DATA_DIR for filenames from train.csv / sample_submission.csv.
   - Use timm with a pretrained small backbone (e.g. `resnet18`, `mobilenetv3_small_100`,
     `efficientnet_b0`). Replace the head for the target classes.
   - Train on CPU with a SMALL image size (e.g. 96–160 px) and 1–3 epochs to stay
     within budget. Use a DataLoader with num_workers=2 and a sensible batch size (32–128).
+  - If images are tiny (for example 64x64 or smaller), strongly prefer a fast
+    baseline first: raw pixels / HOG / color statistics or a tiny CNN. Only add
+    heavier pretrained feature extraction if the budget comfortably allows it.
+  - For larger CPU datasets, prefer a single holdout split or 3-fold CV over 5-fold
+    unless the dataset is small enough that 5-fold clearly fits the budget.
   - For binary cactus / dogs-vs-cats: BCEWithLogitsLoss + sigmoid → threshold 0.5
     or output the probability if sample_submission.csv expects floats.
   - For denoising-dirty-documents (image-to-image): a tiny U-Net trained for a few
@@ -143,6 +158,8 @@ class MLEBenchAgent:
         self.train_preview = self._dataset_preview(data_dir / "train.csv")
         self.test_preview = self._dataset_preview(data_dir / "test.csv")
         self.data_listing = self._list_data_dir(data_dir)
+        self.dataset_profile = self._dataset_profile()
+        self.is_lower_better: bool | None = None
 
     # ------------------------------------------------------------------ utils
 
@@ -204,6 +221,117 @@ class MLEBenchAgent:
                 lines.append(entry.name)
         return "\n".join(lines)
 
+    def _dataset_profile(self) -> str:
+        profile = {
+            "train_csv": self._csv_profile(self.data_dir / "train.csv"),
+            "test_csv": self._csv_profile(self.data_dir / "test.csv"),
+            "sample_submission_csv": self._csv_profile(self.data_dir / "sample_submission.csv"),
+            "image_layout": self._image_layout_profile(),
+        }
+        return json.dumps(profile, indent=2, sort_keys=True)
+
+    @staticmethod
+    def _csv_profile(path: Path, max_rows: int = 3) -> dict[str, object]:
+        if not path.exists():
+            return {"exists": False}
+
+        try:
+            with path.open("r", newline="", errors="replace") as f:
+                reader = csv.DictReader(f)
+                columns = reader.fieldnames or []
+                rows = []
+                for i, row in enumerate(reader):
+                    if i >= max_rows:
+                        break
+                    rows.append(row)
+        except Exception as e:
+            return {"exists": True, "error": str(e)}
+
+        return {
+            "exists": True,
+            "path": path.name,
+            "size_bytes": path.stat().st_size,
+            "columns": columns,
+            "preview_rows": rows,
+        }
+
+    def _image_layout_profile(self) -> dict[str, object]:
+        train_ids = self._csv_column_values(self.data_dir / "train.csv", "id")
+        test_ids = self._csv_column_values(self.data_dir / "sample_submission.csv", "id")
+        image_files = self._sample_image_files(limit=6)
+
+        return {
+            "train_root_candidates": self._match_image_roots(train_ids),
+            "test_root_candidates": self._match_image_roots(test_ids),
+            "sample_images": image_files,
+        }
+
+    @staticmethod
+    def _csv_column_values(path: Path, column: str, limit: int = 8) -> list[str]:
+        if not path.exists():
+            return []
+
+        try:
+            with path.open("r", newline="", errors="replace") as f:
+                reader = csv.DictReader(f)
+                values = []
+                for row in reader:
+                    value = row.get(column)
+                    if value:
+                        values.append(str(value))
+                    if len(values) >= limit:
+                        break
+                return values
+        except Exception:
+            return []
+
+    def _match_image_roots(self, filenames: list[str], max_roots: int = 4) -> list[dict[str, object]]:
+        if not filenames:
+            return []
+
+        counts: Counter[str] = Counter()
+        for name in filenames:
+            try:
+                matches = list(self.data_dir.rglob(name))
+            except Exception:
+                matches = []
+            for match in matches[:3]:
+                try:
+                    rel_parent = str(match.parent.relative_to(self.data_dir))
+                except Exception:
+                    rel_parent = str(match.parent)
+                counts[rel_parent] += 1
+
+        roots = []
+        for path, count in counts.most_common(max_roots):
+            roots.append({"path": path, "matched_filenames": count})
+        return roots
+
+    def _sample_image_files(self, limit: int = 6) -> list[dict[str, object]]:
+        image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".tif", ".tiff"}
+        items: list[dict[str, object]] = []
+        try:
+            candidates = (
+                p for p in self.data_dir.rglob("*")
+                if p.is_file() and p.suffix.lower() in image_exts
+            )
+            for path in candidates:
+                rel_path = str(path.relative_to(self.data_dir))
+                item: dict[str, object] = {"path": rel_path}
+                try:
+                    from PIL import Image
+
+                    with Image.open(path) as img:
+                        item["size"] = list(img.size)
+                except Exception:
+                    pass
+                items.append(item)
+                if len(items) >= limit:
+                    break
+        except Exception:
+            return items
+        return items
+
     @staticmethod
     def _extract_code(text: str) -> str:
         m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
@@ -216,10 +344,13 @@ class MLEBenchAgent:
 
     def _make_plan(self) -> str:
         user = (
+            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
             "COMPETITION DESCRIPTION:\n"
             f"{self.description[:8000]}\n\n"
             "DATA DIR LISTING:\n"
             f"{self.data_listing}\n\n"
+            "STRUCTURED DATASET PROFILE:\n"
+            f"{self.dataset_profile}\n\n"
             "SAMPLE SUBMISSION (first lines):\n"
             f"{self.sample_submission}\n\n"
             "TRAIN PREVIEW (first lines, may be empty for non-tabular comps):\n"
@@ -244,7 +375,7 @@ class MLEBenchAgent:
 
     def _draft_code(self, plan: str, history: list[StepResult]) -> str:
         history_block = ""
-        if history:
+        if history and (history[-1].returncode != 0 or not history[-1].submission_ok):
             last = history[-1]
             history_block = (
                 "PREVIOUS ATTEMPT FAILED OR PRODUCED INVALID SUBMISSION.\n"
@@ -257,12 +388,15 @@ class MLEBenchAgent:
 
         user = (
             f"{history_block}"
+            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
             "PLAN (JSON):\n"
             f"{plan}\n\n"
             "COMPETITION DESCRIPTION (truncated):\n"
             f"{self.description[:6000]}\n\n"
             "DATA DIR LISTING:\n"
             f"{self.data_listing}\n\n"
+            "STRUCTURED DATASET PROFILE:\n"
+            f"{self.dataset_profile}\n\n"
             "SAMPLE SUBMISSION (first lines):\n"
             f"{self.sample_submission}\n\n"
             "TRAIN PREVIEW (may be empty):\n"
@@ -330,6 +464,16 @@ class MLEBenchAgent:
                     )
                 if len(sub) != len(sample):
                     return False, f"row count mismatch: got {len(sub)} expected {len(sample)}"
+                id_col = sample.columns[0] if len(sample.columns) else None
+                if id_col and id_col in sub.columns:
+                    if not sub[id_col].astype(str).equals(sample[id_col].astype(str)):
+                        return False, f"id/order mismatch in column {id_col}"
+                pred_cols = [c for c in sub.columns if c != id_col]
+                for col in pred_cols:
+                    if sub[col].isna().any():
+                        return False, f"column {col} contains NaN values"
+                    if pd.api.types.is_numeric_dtype(sub[col]) and not np.isfinite(sub[col].to_numpy()).all():
+                        return False, f"column {col} contains non-finite numeric values"
             return True, None
         except Exception as e:
             return False, f"could not parse submission: {e}"
@@ -348,6 +492,7 @@ class MLEBenchAgent:
 
     def run(self) -> Path:
         plan = self._make_plan()
+        self.is_lower_better = self._plan_is_lower_better(plan)
         history: list[StepResult] = []
         best: StepResult | None = None
         best_path: Path | None = None
@@ -363,6 +508,9 @@ class MLEBenchAgent:
                 if best is None or self._is_better(result, best):
                     best = result
                     best_path = sub_path
+                if result.returncode == 0:
+                    logger.info("Stopping early after successful iteration %d", i + 1)
+                    break
 
         if best_path is None:
             # No valid submission at all. As a last-ditch effort, copy
@@ -380,7 +528,15 @@ class MLEBenchAgent:
         return best_path
 
     @staticmethod
-    def _is_better(a: StepResult, b: StepResult) -> bool:
+    def _plan_is_lower_better(plan: str) -> bool | None:
+        try:
+            parsed = json.loads(plan)
+        except Exception:
+            return None
+        value = parsed.get("is_lower_better")
+        return value if isinstance(value, bool) else None
+
+    def _is_better(self, a: StepResult, b: StepResult) -> bool:
         # Without metric direction we can't compare CV scores reliably; prefer
         # any valid submission over none, then prefer higher CV (heuristic).
         if a.cv_score is None and b.cv_score is None:
@@ -389,4 +545,6 @@ class MLEBenchAgent:
             return False
         if b.cv_score is None:
             return True
+        if self.is_lower_better is True:
+            return a.cv_score < b.cv_score
         return a.cv_score > b.cv_score

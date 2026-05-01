@@ -26,7 +26,7 @@ roadmap.md           # Handoff doc — read this first if continuing the work
 
 ```bash
 # 0. Install
-pip install -r requirements.txt
+python3.13 -m pip install -r requirements.txt
 
 # 1. Download dataset (needs ~/.kaggle/kaggle.json)
 ./scripts/fetch_spaceship_titanic.sh ./data/spaceship-titanic
@@ -47,8 +47,10 @@ sanity check against `sample_submission.csv`.
 - `OPENAI_API_KEY` — required.
 - `OPENAI_MODEL` — default `gpt-5-mini`.
 - `REASONING_EFFORT` — `low|medium|high`, default `medium`.
-- `MAX_DEBUG_ITERS` — number of plan/code/run cycles, default `3`.
-- `SUBPROCESS_TIMEOUT_SEC` — per-iteration `solution.py` timeout, default `180`.
+- `MAX_DEBUG_ITERS` — number of plan/code/run cycles, default `5`.
+- `SUBPROCESS_TIMEOUT_SEC` — per-iteration `solution.py` timeout, default `1500`.
+- `A2A_MAX_CONTENT_LENGTH` — inbound JSON-RPC request cap in bytes, default
+  `536870912` (512 MiB).
 
 ## Submission to AgentBeats
 

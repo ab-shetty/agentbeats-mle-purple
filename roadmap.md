@@ -24,6 +24,21 @@ Each result JSON includes `score`, medal thresholds (gold/silver/bronze),
 `is_lower_better`, and medal flags. **Top-3 is per competition**, ranked by
 raw score.
 
+### Current AgentBeats MLE-Bench sub-leaderboard snapshot
+
+User-provided reference snapshot as of 2026-05-01. Use this for prioritization
+and difficulty calibration only; do not encode hard-coded competition recipes
+from it into the agent.
+
+| Sub-leaderboard | Current top / status | Score |
+|---|---:|---:|
+| Aerial Cactus Identification | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.99995 |
+| Denoising Dirty Documents | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.01262 |
+| Dogs vs Cats Redux | No results | — |
+| ICML 2013 Whale Challenge | No results; user cannot accept rules | — |
+| Jigsaw Toxic Comment Classification | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.98113 |
+| Spaceship Titanic | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.83218 |
+
 ### 2. Wire protocol (A2A over HTTP)
 The purple agent serves an A2A endpoint on **port 8080** (hardcoded in the
 official manifest). Source of truth for the contract:
@@ -69,19 +84,13 @@ Pin to digest at submission time (`@sha256:...`).
 
 1. ~~End-to-end smoke test~~ ✅ Done. Spaceship-titanic CV ~0.811 (bronze
    range) on the universal image.  Jigsaw smoke test attempted
-   (2026-05-01) — **blocked by an A2A JSON-RPC `Payload too large` error**
-   on the 53 MB `competition.tar.gz`. The server returned `Code=-32600
-   Payload too large` before reaching the executor. Two implications:
-     - The `scripts/local_test.py` driver hits the SDK's default JSON-RPC
-       size cap. Need to either raise that cap on the server (look for a
-       max-payload kwarg on `A2AStarletteApplication` / its router), or
-       have the driver chunk via multiple parts. The real green agent
-       likely uses the same default — so this is **a real risk for any
-       MLE-Bench competition with a >~10 MB tarball** (which is most of
-       them; spaceship-titanic was an outlier at <1 MB).
-     - Until that is resolved, only small-data comps (spaceship-titanic,
-       aerial-cactus 32×32, denoising-dirty-documents) have been
-       de-risked. **Investigate first thing next session.**
+   (2026-05-01) — initially blocked by an A2A JSON-RPC `Payload too large`
+   error on the 53 MB `competition.tar.gz`. **Fixed 2026-05-01:** `src/server.py`
+   now passes `max_content_length` to `A2AStarletteApplication`, defaulting to
+   512 MiB via `A2A_MAX_CONTENT_LENGTH`. In-process regression check confirmed
+   an 11 MiB JSON-RPC body returns `Payload too large` at the SDK's 10 MiB
+   limit but reaches normal JSON-RPC routing (`Method not found`) with the new
+   512 MiB limit. Next step is to retry the real jigsaw smoke test.
 2. **Image not built / pushed**. Need GHCR push to `ghcr.io/<gh-user>/mle-bench-purple:v1`.
 3. **Validation handshake unused**. The agent does NOT currently negotiate
    schema with the green via the `"validate"` message. Adding that would
@@ -95,26 +104,70 @@ Pin to digest at submission time (`@sha256:...`).
    two images or one fat image (~3 GB).
 5. **Quality tuning of prompts.** The current planner/coder system prompts
    are reasonable defaults but were not iterated against actual leaderboard
-   scores. The biggest quality lever is the **coder** prompt — encourage
-   feature engineering specific to spaceship-titanic (split `Cabin` into
-   `deck/num/side`, parse `PassengerId` group, group-aware imputation,
-   stack LightGBM + CatBoost) to push from bronze (~0.810) toward silver
-   (~0.814) and gold (~0.821).
+   scores. Keep prompt improvements generic and task-derived: the agent should
+   infer feature engineering and model choices from `description.md`, file
+   layout, data previews, and `sample_submission.csv`, rather than receiving
+   hard-coded competition recipes.
+6. **Debug loop is still too rewrite-heavy.** Some useful hardening landed on
+   2026-05-01:
+   - `src/agent.py` now builds a structured dataset profile (CSV columns +
+     preview rows, detected image-root candidates, sample image sizes) and
+     passes it to both planner and coder.
+   - The image guidance now pushes tiny-image tasks toward fast CPU baselines
+     first, and the agent now validates `id` order plus NaN/non-finite values.
+   - The control flow now stops after the first clean submission instead of
+     continuing into a bogus "debug" iteration.
+   But the recovery path is still broad "rewrite the whole script" behavior.
+   The next step is to make it behave more like a coding agent:
+   - First pass: draft a full `solution.py`.
+   - On ordinary failures (runtime errors, import/path bugs, malformed
+     submission schema), run a **repair** prompt that patches the current
+     script minimally using the existing code plus stdout/stderr/validation
+     error as context.
+   - Reserve broader re-synthesis / redesign only for timeouts, clearly poor
+     CV, or evidence that the whole modeling approach is wrong.
+   - The control loop should classify failures (`execution bug`, `path/data
+     bug`, `schema bug`, `timeout`, `poor score`) and route only the last two
+     to a fresh strategy prompt.
 
 ## Verified locally
 
 - All five Python files compile under Python 3.12.
+- Requirements installed under the local Python 3.13 environment
+  (`pip` is bound to Python 3.13; `/usr/bin/python` is Python 3.8 and cannot run
+  this code).
 - Server boots and serves `/.well-known/agent-card.json` on port 8080.
+- A2A large-payload cap was raised from the SDK default 10 MiB to 512 MiB
+  (`A2A_MAX_CONTENT_LENGTH`).
+- `jigsaw-toxic-comment-classification-challenge-smoke`: valid `3000`-row
+  submission in `164.7s`; generated script completed with `cv=0.918476`.
+- `denoising-dirty-documents-smoke`: valid `278640`-row submission in `104.3s`;
+  generated script completed with `cv=0.142267`.
+- `aerial-cactus-identification-smoke`: valid `500`-row submission in `85.4s`
+  before the 2026-05-01 agent changes. After adding the structured dataset
+  profile + budget-aware image guidance, the same smoke run finished in `42.6s`.
+- `aerial-cactus-identification` full data: planner correctly inferred nested
+  image roots (`train/train/*.jpg`, `test/test/*.jpg`). With
+  `MAX_DEBUG_ITERS=1`, the first generated script failed on an OpenCV dtype bug
+  during feature extraction and fell back to `sample_submission.csv`. With
+  `MAX_DEBUG_ITERS=2`, the agent self-corrected and produced a valid `4000`-row
+  submission in `455.0s`; the two successful iterations logged `cv=0.9576` and
+  `cv=0.959771`. After that run, the control loop was fixed to stop after the
+  first clean submission.
 - **a2a-sdk version pin is critical**: pip's resolver picks `1.0.x` by default,
   which has a breaking API change (no `a2a.server.apps`). `requirements.txt`
   pins `>=0.3.20,<1.0` — keep it that way unless you also rewrite the imports.
 
 ## Not yet verified
 
-- End-to-end run with real `OPENAI_API_KEY` + spaceship-titanic data. The
-  server starts and the protocol shape is right, but a full plan/code/exec
-  cycle has not been exercised. The user said the API key is in env; running
-  one full cycle will cost a few cents in tokens.
+- End-to-end run with real `OPENAI_API_KEY` + `spaceship-titanic` data under
+  the current agent version.
+- End-to-end run with `dogs-vs-cats-redux-kernels-edition`, which is the most
+  attractive standing opportunity because the current AgentBeats sub-leaderboard
+  is empty.
+- Whether the repaired/full Aerial local submission is competitive on Kaggle or
+  merely valid. Local CV is encouraging, but no external leaderboard score has
+  been checked from this repo state.
 
 ## Open questions for the user
 
@@ -184,15 +237,18 @@ GitHub user is `ab-shetty` (Kaggle username is `abhishek1shetty`). Repo name:
 
 ## Where to push next for top-3
 
-1. **Iterate the coder prompt on spaceship-titanic.** The model hint that
-   moves the needle most is "engineer features from Cabin (deck/num/side),
-   parse PassengerId group, and stack LightGBM + CatBoost with stratified
-   5-fold CV". Add competition-specific hints conditional on
-   `competition_id` if you can detect it from `description.md`.
-2. **Bump `MAX_DEBUG_ITERS` to 5+** when wall-clock budget allows; pair with
-   `REASONING_EFFORT=high`.
+1. **Use `dogs-vs-cats-redux-kernels-edition` as the next ranking lane.**
+   Aerial Cactus is now a decent local image testbed, but the current
+   AgentBeats Dogs vs Cats sub-leaderboard is empty, so even a solid generic
+   image agent may place immediately.
+2. **Keep iterating the coder/debug loop generically.** The dataset-profile
+   work improved Aerial materially, but the next lift is a true repair prompt
+   instead of full script rewrites after ordinary runtime bugs.
 3. **Implement the validate handshake** (see § "What is NOT done yet" #3).
 4. **Add CV-image variant** for image competitions.
-5. **Self-consistency / ensembling.** Run 3 distinct solution drafts in
+5. **Use higher iteration budgets selectively.** `MAX_DEBUG_ITERS=2` was enough
+   to recover a full Aerial run; reserve `5+` for slower tasks or when paired
+   with stronger repair logic and `REASONING_EFFORT=high`.
+6. **Self-consistency / ensembling.** Run 3 distinct solution drafts in
    parallel (different seeds / model families) and majority-vote / average
    probabilities for the final submission.
