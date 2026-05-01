@@ -7,8 +7,8 @@ top-to-bottom before touching code.
 
 Build a competitive **purple agent** for the AgentBeats Phase 2 MLE-Bench
 benchmark (research agent track). User signed up at agentbeats.dev as
-`ashetty21@berkeley.edu`. Target a top-3 finish on at least one
-per-competition sub-leaderboard, starting with **`spaceship-titanic`**.
+`ashetty21@berkeley.edu`. Target a top-3 finish on at least 4
+per-competition sub-leaderboards.
 
 ## Background — important things to know
 
@@ -16,8 +16,7 @@ per-competition sub-leaderboard, starting with **`spaceship-titanic`**.
 Each Kaggle competition has its **own** sub-leaderboard at
 `github.com/RDI-Foundation/MLE-bench-agentbeats-leaderboard`. Active comps:
 spaceship-titanic, aerial-cactus-identification, dogs-vs-cats-redux,
-right-whale-redux, jigsaw-toxic-comment-classification, denoising-dirty-documents,
-mlsp-2013-birds, dog-breed-identification, text-normalization-english.
+right-whale-redux, jigsaw-toxic-comment-classification, denoising-dirty-documents.
 
 Spaceship-titanic has 157/172 logged runs — it's the busy/canonical lane.
 Each result JSON includes `score`, medal thresholds (gold/silver/bronze),
@@ -32,12 +31,12 @@ from it into the agent.
 
 | Sub-leaderboard | Current top / status | Score |
 |---|---:|---:|
-| Aerial Cactus Identification | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.99995 |
-| Denoising Dirty Documents | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.01262 |
+| Aerial Cactus Identification |<redacted-name>, 1st | 0.99995 |
+| Denoising Dirty Documents | <redacted-name>, 1st | 0.01262 |
 | Dogs vs Cats Redux | No results | — |
 | ICML 2013 Whale Challenge | No results; user cannot accept rules | — |
-| Jigsaw Toxic Comment Classification | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.98113 |
-| Spaceship Titanic | `dirk61/mle-squad` — Claude Sonnet 4.6, 1st | 0.83218 |
+| Jigsaw Toxic Comment Classification | <redacted-name> — Claude Sonnet 4.6, 1st | 0.98113 |
+| Spaceship Titanic | <redacted-name> — Claude Sonnet 4.6, 1st | 0.83218 |
 
 ### 2. Wire protocol (A2A over HTTP)
 The purple agent serves an A2A endpoint on **port 8080** (hardcoded in the
@@ -160,7 +159,7 @@ Pin to digest at submission time (`@sha256:...`).
 
 ## Not yet verified
 
-- End-to-end run with real `OPENAI_API_KEY` + `spaceship-titanic` data under
+- End-to-end run with real `OPENAI_API_KEY` under
   the current agent version.
 - End-to-end run with `dogs-vs-cats-redux-kernels-edition`, which is the most
   attractive standing opportunity because the current AgentBeats sub-leaderboard
@@ -171,12 +170,7 @@ Pin to digest at submission time (`@sha256:...`).
 
 ## Open questions for the user
 
-1. **Kaggle credentials.** They sent `KGAT_6c248b1d98a39a0e233a8ee54557d2cc`.
-   That looks like a single token, but Kaggle's CLI needs `username` + `key`
-   in `~/.kaggle/kaggle.json`. Ask them to confirm or to provide the
-   `kaggle.json` contents. Workaround: they can manually download the dataset
-   from kaggle.com and unzip it into `./data/spaceship-titanic/`.
-2. **Whether to implement the validation handshake** before first submission.
+1. **Whether to implement the validation handshake** before first submission.
    It costs ~half a day to add but reduces the chance of a 0-score submission
    from a schema bug.
 
