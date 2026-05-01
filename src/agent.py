@@ -128,6 +128,34 @@ OTHER:
   - Read the description carefully and synthesize a sensible CPU-friendly approach."""
 
 
+SYSTEM_PROMPT_REPAIR = """You are a senior Python engineer fixing a bug in an existing ML script.
+
+You will receive:
+  - The previous solution.py
+  - The captured stdout / stderr from running it (stderr is the source of truth)
+  - The validation error if the produced submission CSV was malformed
+
+Your job is to output a REPAIRED full solution.py that fixes the root cause with
+the minimum possible diff. Constraints:
+
+  - Output ONLY a Python code block delimited by ```python ... ``` and nothing else.
+  - Keep the overall approach (model family, feature pipeline, CV strategy) identical
+    unless the bug *is* the approach. This is a repair, not a redesign.
+  - Identify the precise line(s) that caused the failure and patch them. Do not
+    refactor unrelated code, do not rename functions, do not swap models.
+  - Common bug categories to repair correctly:
+      * AttributeError / TypeError / NameError → fix the misuse, keep the call site.
+      * FileNotFoundError / wrong path → use the actual paths from the dataset profile.
+      * DataLoader collate errors when __getitem__ returns None → filter Nones in the
+        Dataset, or use a custom collate_fn that drops None, or guarantee a tensor.
+      * LightGBM 4.x API errors → use callbacks, not fit() kwargs.
+      * Submission schema mismatch → match sample_submission.csv columns and order.
+      * NaN / non-finite predictions → clip or fillna before writing CSV.
+  - Read data from os.environ['DATA_DIR']. Write predictions to os.environ['OUTPUT_PATH'].
+  - Must produce a submission CSV that matches sample_submission.csv exactly.
+  - Print "CV score: <number>" if you compute CV (preserve the existing print)."""
+
+
 @dataclass
 class StepResult:
     code: str
@@ -377,13 +405,20 @@ class MLEBenchAgent:
         history_block = ""
         if history and (history[-1].returncode != 0 or not history[-1].submission_ok):
             last = history[-1]
+            reason = "TIMED OUT" if last.returncode == -2 else "FAILED OR PRODUCED INVALID SUBMISSION"
+            scope_hint = (
+                "Previous attempt exceeded the execution budget. Reduce scope:"
+                " smaller image size, fewer folds, smaller backbone, or skip TTA/calibration.\n\n"
+                if last.returncode == -2
+                else "Rewrite the script from scratch, fixing the root cause.\n\n"
+            )
             history_block = (
-                "PREVIOUS ATTEMPT FAILED OR PRODUCED INVALID SUBMISSION.\n"
+                f"PREVIOUS ATTEMPT {reason}.\n"
                 f"--- previous code ---\n{last.code[:6000]}\n"
                 f"--- stdout (tail) ---\n{last.stdout[-2000:]}\n"
                 f"--- stderr (tail) ---\n{last.stderr[-2000:]}\n"
                 f"--- submission_error ---\n{last.submission_error or '(none)'}\n"
-                "Rewrite the script from scratch, fixing the root cause.\n\n"
+                + scope_hint
             )
 
         user = (
@@ -408,6 +443,44 @@ class MLEBenchAgent:
         )
         text = openai_client.complete(SYSTEM_PROMPT_CODER, user, max_output_tokens=12000)
         return self._extract_code(text)
+
+    def _repair_code(self, last: StepResult) -> str:
+        user = (
+            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
+            "DATA DIR LISTING:\n"
+            f"{self.data_listing}\n\n"
+            "STRUCTURED DATASET PROFILE:\n"
+            f"{self.dataset_profile}\n\n"
+            "SAMPLE SUBMISSION (first lines):\n"
+            f"{self.sample_submission}\n\n"
+            "--- previous solution.py (full) ---\n"
+            f"{last.code}\n"
+            "--- stdout (tail) ---\n"
+            f"{last.stdout[-3000:]}\n"
+            "--- stderr (tail) ---\n"
+            f"{last.stderr[-3000:]}\n"
+            "--- submission_error ---\n"
+            f"{last.submission_error or '(none)'}\n\n"
+            "Output the repaired full solution.py. Minimum diff. Keep the overall approach."
+        )
+        text = openai_client.complete(SYSTEM_PROMPT_REPAIR, user, max_output_tokens=12000)
+        return self._extract_code(text)
+
+    @staticmethod
+    def _classify_failure(result: StepResult) -> str:
+        """Classify why an iteration failed.
+
+        Returns one of: ok | timeout | schema_bug | execution_bug.
+        Routes the next iteration to repair (execution_bug, schema_bug) vs
+        full rewrite with reduced scope (timeout) vs nothing (ok).
+        """
+        if result.returncode == 0 and result.submission_ok:
+            return "ok"
+        if result.returncode == -2:
+            return "timeout"
+        if result.returncode == 0 and not result.submission_ok:
+            return "schema_bug"
+        return "execution_bug"
 
     def _execute(self, code: str, iter_idx: int) -> StepResult:
         script_path = self.solutions_dir / f"solution_{iter_idx}.py"
@@ -499,7 +572,16 @@ class MLEBenchAgent:
 
         for i in range(self.max_iters):
             logger.info("=== iteration %d/%d ===", i + 1, self.max_iters)
-            code = self._draft_code(plan, history)
+            if history:
+                category = self._classify_failure(history[-1])
+                logger.info("Previous iter classified as: %s", category)
+                if category in {"execution_bug", "schema_bug"}:
+                    code = self._repair_code(history[-1])
+                else:
+                    # timeout or first run after ok (shouldn't happen — ok exits)
+                    code = self._draft_code(plan, history)
+            else:
+                code = self._draft_code(plan, history)
             result = self._execute(code, i)
             history.append(result)
 

@@ -59,6 +59,26 @@ Outbound to green:
 The green's httpx client has `timeout=3600` (1 hour). The Quick Submit GH
 Actions runner additionally enforces `RESULTS_TIMEOUT_MINUTES=30` by default.
 
+### 2.5. Grading runner is CPU-only with a 30-min walltime cap
+Confirmed 2026-05-01 by reading
+`RDI-Foundation/MLE-bench-agentbeats-leaderboard/.github/workflows/quick-submit-runner.yml`:
+- `runs-on: ubuntu-latest` → standard GitHub-hosted runner (4 vCPU, 16 GB RAM,
+  ~14 GB disk, **no GPU**).
+- `RESULTS_TIMEOUT_MINUTES: 30` (overridable per-leaderboard via
+  `vars.QUICK_SUBMIT_TIMEOUT_MINUTES`, but **submitters cannot change it**).
+- The 30 minutes covers everything: image pulls, container start, green
+  agent shipping the tarball over A2A, our agent's full plan/code/run loop,
+  schema validation, and results capture. Realistic agent-only budget after
+  pulls + transfer of an 800 MB-class dataset is closer to **20–25 min**.
+- Implication: total agent runtime budget is
+  `MAX_DEBUG_ITERS × SUBPROCESS_TIMEOUT_SEC + OpenAI calls + tarball IO`.
+  Bumping per-iter timeout without lowering iter count busts the cap.
+  Sensible per-modality defaults:
+  - Tabular: `MAX_DEBUG_ITERS=3, SUBPROCESS_TIMEOUT_SEC=300`.
+  - Image (e.g. dogs-vs-cats, aerial-cactus): `MAX_DEBUG_ITERS=2,
+    SUBPROCESS_TIMEOUT_SEC=700`. One full draft + one repair pass.
+  - Set these per-competition in the AgentBeats config block of the manifest.
+
 ### 3. Image / manifest contract
 Image must be `linux/amd64`, pushed to GHCR, package made public.
 Manifest expects port 8080 and a single A2A endpoint. The user's
@@ -75,6 +95,7 @@ Pin to digest at submission time (`@sha256:...`).
 | `src/openai_client.py` | ✅ | Responses API wrapper, model from `OPENAI_MODEL` env. |
 | `scripts/local_test.py` | ✅ | Mocked-green driver. Sends instructions+tar, captures artifact. |
 | `scripts/fetch_spaceship_titanic.sh` | ✅ | Kaggle CLI wrapper + writes `description.md`. |
+| `scripts/fetch_dogs_vs_cats.sh` | ✅ | Kaggle CLI wrapper for `dogs-vs-cats-redux-kernels-edition`; supports new `KAGGLE_API_TOKEN` env var auth. |
 | `Dockerfile` | ✅ | python:3.12-slim + CPU torch wheels (separate layer), exposes 8080. |
 | `amber-manifest.json5` | ✅ | Image ref placeholder — update before submit. |
 | `requirements.txt` | ✅ | a2a-sdk, openai, pandas, numpy, sklearn, lightgbm, xgboost, timm, transformers, pillow, opencv-headless. |
@@ -107,27 +128,21 @@ Pin to digest at submission time (`@sha256:...`).
    infer feature engineering and model choices from `description.md`, file
    layout, data previews, and `sample_submission.csv`, rather than receiving
    hard-coded competition recipes.
-6. **Debug loop is still too rewrite-heavy.** Some useful hardening landed on
-   2026-05-01:
-   - `src/agent.py` now builds a structured dataset profile (CSV columns +
-     preview rows, detected image-root candidates, sample image sizes) and
-     passes it to both planner and coder.
-   - The image guidance now pushes tiny-image tasks toward fast CPU baselines
-     first, and the agent now validates `id` order plus NaN/non-finite values.
-   - The control flow now stops after the first clean submission instead of
-     continuing into a bogus "debug" iteration.
-   But the recovery path is still broad "rewrite the whole script" behavior.
-   The next step is to make it behave more like a coding agent:
-   - First pass: draft a full `solution.py`.
-   - On ordinary failures (runtime errors, import/path bugs, malformed
-     submission schema), run a **repair** prompt that patches the current
-     script minimally using the existing code plus stdout/stderr/validation
-     error as context.
-   - Reserve broader re-synthesis / redesign only for timeouts, clearly poor
-     CV, or evidence that the whole modeling approach is wrong.
-   - The control loop should classify failures (`execution bug`, `path/data
-     bug`, `schema bug`, `timeout`, `poor score`) and route only the last two
-     to a fresh strategy prompt.
+6. ~~Debug loop is still too rewrite-heavy.~~ ✅ Repair flow landed 2026-05-01.
+   Earlier hardening (structured dataset profile, fast-CPU image guidance, stop
+   after first clean submission) is still in place. New on 2026-05-01:
+   - `_classify_failure()` routes the next iter:
+     - `rc=0 + submission_ok` → `ok` (loop exits early as before).
+     - `rc=-2` → `timeout` → full rewrite via `_draft_code` with a
+       reduce-scope hint (smaller image size, fewer folds, lighter backbone).
+     - `rc=0 + bad submission` → `schema_bug` → minimal-diff repair.
+     - any other non-zero rc → `execution_bug` → minimal-diff repair.
+   - `_repair_code()` uses a separate `SYSTEM_PROMPT_REPAIR` system prompt that
+     emphasizes "fix the bug, don't redesign". Sends the full prior code plus
+     stdout/stderr/validation error as context.
+   - The rewrite-on-timeout path now also tells the model the previous run
+     timed out and to reduce scope, instead of being indistinguishable from a
+     bug rewrite.
 
 ## Verified locally
 
@@ -153,20 +168,27 @@ Pin to digest at submission time (`@sha256:...`).
   submission in `455.0s`; the two successful iterations logged `cv=0.9576` and
   `cv=0.959771`. After that run, the control loop was fixed to stop after the
   first clean submission.
+- `dogs-vs-cats-redux-kernels-edition` full data (2026-05-01, post-repair):
+  with `MAX_DEBUG_ITERS=2`, `SUBPROCESS_TIMEOUT_SEC=700`, the first iteration
+  produced a valid 12,500-row submission in `532.8s` (`cv=0.076047` log-loss
+  on internal holdout). Tarball was 840 MB — required bumping
+  `A2A_MAX_CONTENT_LENGTH` past the 512 MiB default; we run local with 2 GiB.
+  Repair path was not exercised because iter 1 succeeded.
 - **a2a-sdk version pin is critical**: pip's resolver picks `1.0.x` by default,
   which has a breaking API change (no `a2a.server.apps`). `requirements.txt`
   pins `>=0.3.20,<1.0` — keep it that way unless you also rewrite the imports.
 
 ## Not yet verified
 
-- End-to-end run with real `OPENAI_API_KEY` under
-  the current agent version.
-- End-to-end run with `dogs-vs-cats-redux-kernels-edition`, which is the most
-  attractive standing opportunity because the current AgentBeats sub-leaderboard
-  is empty.
-- Whether the repaired/full Aerial local submission is competitive on Kaggle or
-  merely valid. Local CV is encouraging, but no external leaderboard score has
-  been checked from this repo state.
+- Whether any of the locally validated submissions (Aerial Cactus, Jigsaw,
+  Denoising, Spaceship Titanic, Dogs vs Cats) are competitive on the AgentBeats
+  sub-leaderboards or merely valid. Local CV is encouraging across the board
+  but no external leaderboard score has been checked from this repo state.
+- End-to-end run inside the actual AgentBeats Quick Submit runner (next step
+  is the GHCR push + manifest update + Quick Submit).
+- Whether the repair path actually recovers a real failed run end-to-end on
+  data we hold (the dogs-vs-cats run that exercised it would have helped, but
+  iter 1 succeeded).
 
 ## Open questions for the user
 
@@ -240,9 +262,10 @@ GitHub user is `ab-shetty` (Kaggle username is `abhishek1shetty`). Repo name:
    instead of full script rewrites after ordinary runtime bugs.
 3. **Implement the validate handshake** (see § "What is NOT done yet" #3).
 4. **Add CV-image variant** for image competitions.
-5. **Use higher iteration budgets selectively.** `MAX_DEBUG_ITERS=2` was enough
-   to recover a full Aerial run; reserve `5+` for slower tasks or when paired
-   with stronger repair logic and `REASONING_EFFORT=high`.
+5. ~~Use higher iteration budgets selectively.~~ Reframed by §2.5: the 30-min
+   outer cap means total budget is fixed, so picking `MAX_DEBUG_ITERS` and
+   `SUBPROCESS_TIMEOUT_SEC` is a per-modality split of that envelope, not a
+   knob to push higher. Defaults already in §2.5.
 6. **Self-consistency / ensembling.** Run 3 distinct solution drafts in
    parallel (different seeds / model families) and majority-vote / average
    probabilities for the final submission.

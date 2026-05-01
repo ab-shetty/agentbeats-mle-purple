@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 # Download the spaceship-titanic dataset for local testing.
 #
-# Requires:
-#   pip install kaggle
-#   ~/.kaggle/kaggle.json  with {"username": "...", "key": "..."}
-#       chmod 600 ~/.kaggle/kaggle.json
+# Auth: either ~/.kaggle/kaggle.json OR KAGGLE_API_TOKEN env var (new
+# Kaggle CLI 2.x format — single opaque token starting with `KGAT_`).
 #
 # After downloading we add a description.md (Kaggle's official task page text)
 # so the layout matches what the real green agent serves to the purple.
@@ -16,19 +14,6 @@ cd "$DATA_DIR"
 
 if ! command -v kaggle >/dev/null 2>&1; then
   echo "kaggle CLI not found. Install with: pip install kaggle" >&2
-  exit 1
-fi
-
-if [[ ! -s ~/.kaggle/kaggle.json ]]; then
-  cat >&2 <<'EOF'
-~/.kaggle/kaggle.json missing.
-Create it with:
-  mkdir -p ~/.kaggle
-  cat > ~/.kaggle/kaggle.json <<JSON
-  {"username":"<YOUR_KAGGLE_USERNAME>","key":"<YOUR_KAGGLE_KEY>"}
-  JSON
-  chmod 600 ~/.kaggle/kaggle.json
-EOF
   exit 1
 fi
 
