@@ -42,6 +42,13 @@ python scripts/local_test.py --data-dir ./data/spaceship-titanic
 `local_test.py` saves the returned CSV as `submission.csv` and prints a schema
 sanity check against `sample_submission.csv`.
 
+For AgentBeats Quick Submit, you can override the model at submission time in
+the Config JSON, for example:
+
+```json
+{"openai_model":"gpt-5.2","reasoning_effort":"high"}
+```
+
 ## Tunables (env vars)
 
 - `OPENAI_API_KEY` — required.
@@ -54,4 +61,5 @@ sanity check against `sample_submission.csv`.
 
 ## Submission to AgentBeats
 
-See `roadmap.md` § "Submission steps".
+See `roadmap.md` § "Submission steps". The submission-time model override is
+`openai_model` in the Config JSON.

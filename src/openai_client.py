@@ -1,6 +1,6 @@
 """Thin OpenAI Responses-API wrapper used by the agent loop.
 
-Uses the env var OPENAI_API_KEY and a fixed model (gpt-5-mini by default).
+Uses OPENAI_API_KEY plus the model from OPENAI_MODEL (default `gpt-5-mini`).
 Exposes a `complete(system, user, ...)` helper that returns plain text.
 """
 from __future__ import annotations

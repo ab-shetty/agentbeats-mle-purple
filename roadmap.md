@@ -100,6 +100,8 @@ For the Quick Submit path:
 Image must be `linux/amd64`, pushed to GHCR, package made public.
 Manifest expects port 8080 and a single A2A endpoint. The user's
 `OPENAI_API_KEY` is passed via `${config.openai_api_key}` (mark `secret: true`).
+`OPENAI_MODEL` can now be overridden at submission time via
+`${config.openai_model}`; when omitted, runtime default remains `gpt-5-mini`.
 Pin to digest at submission time (`@sha256:...`).
 
 ## Submitted results so far (Quick Submit, agentbeats.dev)
@@ -129,14 +131,14 @@ Notes:
 |---|---|---|
 | `src/server.py` | ✅ | A2A Starlette app, port 8080, agent card. Honors `A2A_MAX_CONTENT_LENGTH` (default 512 MiB) for large tarballs. |
 | `src/executor.py` | ✅ | Extracts tarball to a workspace, calls agent, emits FilePart artifact. |
-| `src/agent.py` | ✅ | Plan → Code → Execute → Debug loop. Universal: tabular / text / image / other, modality-branched coder prompt. Repair flow lands minimum-diff fixes for execution / schema bugs; full rewrite (with reduce-scope hint) on timeout. |
+| `src/agent.py` | ✅ | Plan → Code → Execute → Debug loop. Universal: tabular / text / image / other, modality-branched coder prompt. Includes structured dataset profiling (dtypes/nulls/example values), stronger tabular leakage/dtype guidance, repair flow for execution / schema bugs, and self-consistency with ensembling for cheap modalities. |
 | `src/openai_client.py` | ✅ | Responses API wrapper, model from `OPENAI_MODEL` env. |
 | `scripts/local_test.py` | ✅ | Mocked-green driver. Sends instructions+tar, captures artifact. |
 | `scripts/fetch_spaceship_titanic.sh` | ✅ | Kaggle CLI wrapper + writes `description.md`. |
 | `scripts/fetch_dogs_vs_cats.sh` | ✅ | Kaggle CLI wrapper for `dogs-vs-cats-redux-kernels-edition`; supports new `KAGGLE_API_TOKEN` env var auth. |
 | `Dockerfile` | ✅ | python:3.12-slim + CPU torch wheels (separate layer), exposes 8080. |
 | `amber-manifest.json5` | ✅ | Image ref placeholder — update before submit. |
-| `requirements.txt` | ✅ | a2a-sdk pinned `>=0.3.20,<1.0`; openai, pandas, numpy, sklearn, lightgbm, xgboost, timm, transformers, pillow, opencv-headless. |
+| `requirements.txt` | ✅ | a2a-sdk pinned `>=0.3.20,<1.0`; openai, pandas, numpy, sklearn, lightgbm, xgboost, timm, transformers, pillow, opencv-headless, kaggle. |
 
 ## What is NOT done yet
 
@@ -157,9 +159,11 @@ Notes:
    EfficientNet-B3+, 5-fold + TTA) gated by an env var would let the same
    image compete on the un-capped path for heavier comps. See "Where to push
    next" #4.
-4. **Repair flow not yet exercised on a real failed run end-to-end.** The
-   dogs-vs-cats run that would have stress-tested it succeeded on iter 1;
-   spaceship-titanic regression test likewise hit success on iter 1.
+4. **Self-consistency quality is not yet leaderboard-proven.** The mechanism
+   now works end-to-end locally, but the latest spaceship-titanic smoke
+   (`cv=0.813758`, `cv=0.810192`, valid ensemble artifact) did NOT exceed the
+   user's existing leaderboard result of `0.81839`. Reliability improved;
+   competitive lift is still unproven.
 
 ## Verified locally
 
@@ -193,6 +197,15 @@ Notes:
     `cv=0.757` in 144s; first-draft path is unchanged from pre-refactor, so
     the lower CV vs prior 0.811 baseline is model variance + GroupKFold-by-
     family being more rigorous than the prior StratifiedKFold.
+  - `spaceship-titanic` self-consistency smoke (2026-05-02): with
+    `SELF_CONSISTENCY_N=2`, `MAX_DEBUG_ITERS=5`, `SUBPROCESS_TIMEOUT_SEC=300`,
+    the planner correctly recognized `Transported` as boolean and called for
+    group-aware validation from `PassengerId`. Draft 1 succeeded with
+    `cv=0.813758`; draft 2 initially failed to create a submission, then the
+    repair flow recovered it to `cv=0.810192`. Agent returned a valid ensemble
+    artifact in 188.2s with correct submission schema. This validates the
+    self-consistency control path mechanically, but not as a leaderboard gain
+    versus the existing `0.81839` submission.
 
 ## Open questions for the user
 
@@ -209,13 +222,19 @@ Once dataset is in `./data/spaceship-titanic/`:
 ```bash
 # Terminal 1
 export OPENAI_API_KEY=sk-...
+export MAX_DEBUG_ITERS=3
+export SUBPROCESS_TIMEOUT_SEC=300
 python -m src.server --host 127.0.0.1 --port 8080
 
 # Terminal 2
 python scripts/local_test.py --data-dir ./data/spaceship-titanic
 ```
 
-Expectation with defaults (3 iterations, 300s timeout each):
+This is a smoke-test profile, not the code defaults. Current code defaults are
+`MAX_DEBUG_ITERS=5` and `SUBPROCESS_TIMEOUT_SEC=1500`; for a 10-minute local
+check, override them as above.
+
+Expectation with the smoke-test profile (3 iterations, 300s timeout each):
 - Total run time 4–8 minutes (most spent in OpenAI calls).
 - Final `submission.csv` matches `sample_submission.csv` schema.
 - LightGBM CV accuracy ~0.75–0.81 on 5-fold (varies with seed and CV strategy).
@@ -248,6 +267,8 @@ To re-submit after agent changes:
      `https://raw.githubusercontent.com/ab-shetty/agentbeats-mle-purple/main/amber-manifest.json5`
    - Pick the MLE-Bench leaderboard + a competition.
    - Paste the encrypted `openai_api_key` secret.
+   - Optional Config JSON, e.g.
+     `{"openai_model":"gpt-5.2","reasoning_effort":"high"}`
    - The runner forks the leaderboard repo, opens a PR, and writes the
      result JSON.
 
@@ -265,6 +286,7 @@ To re-submit after agent changes:
    bigger `MAX_DEBUG_ITERS`, larger backbones, 5-fold + TTA. Same image,
    different config, lets us compete on heavier comps without busting the
    30-min Quick Submit cap.
-5. **Self-consistency / ensembling.** Run 3 distinct solution drafts in
-   parallel (different seeds / model families) and majority-vote / average
-   probabilities for the final submission.
+5. **Tune self-consistency / ensembling, do not just add it.** The mechanism
+   is now implemented and mechanically works, but next work is to improve its
+   draft success rate and only enable it where it is score-positive within the
+   30-minute budget.

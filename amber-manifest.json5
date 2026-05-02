@@ -17,7 +17,7 @@
     ],
     env: {
       OPENAI_API_KEY: "${config.openai_api_key}",
-      OPENAI_MODEL: "gpt-5-mini",
+      OPENAI_MODEL: { when: "config.openai_model", value: "${config.openai_model}" },
       REASONING_EFFORT: { when: "config.reasoning_effort", value: "${config.reasoning_effort}" },
       MAX_DEBUG_ITERS: { when: "config.max_debug_iters", value: "${config.max_debug_iters}" },
       SUBPROCESS_TIMEOUT_SEC: { when: "config.subprocess_timeout_sec", value: "${config.subprocess_timeout_sec}" },
@@ -33,6 +33,7 @@
     type: "object",
     properties: {
       openai_api_key:         { type: "string", secret: true },
+      openai_model:           { type: "string" },
       reasoning_effort:       { type: "string" },
       max_debug_iters:        { type: "string" },
       subprocess_timeout_sec: { type: "string" },
