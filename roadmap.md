@@ -34,8 +34,8 @@ hard-coded competition recipes from it into the agent.
 | Denoising Dirty Documents | <redacted-name>, 1st | 0.01262 |
 | Dogs vs Cats Redux | No results | — |
 | ICML 2013 Whale Challenge | No results; user cannot accept rules | — |
-| Jigsaw Toxic Comment Classification | <redacted-name> — Claude Sonnet 4.6, 1st | 0.98113 |
-| Spaceship Titanic | <redacted-name> — Claude Sonnet 4.6, 1st | 0.83218 |
+| Jigsaw Toxic Comment Classification | <redacted-name>, 1st | 0.98113 |
+| Spaceship Titanic | <redacted-name>, 1st | 0.83218 |
 
 ### 2. Wire protocol (A2A over HTTP)
 The purple agent serves an A2A endpoint on **port 8080** (hardcoded in the
