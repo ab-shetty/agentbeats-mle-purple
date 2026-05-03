@@ -4,7 +4,7 @@
 // Pin to an immutable digest at submission time, e.g.:
 //   ghcr.io/<YOUR_GHCR_USER>/mle-bench-purple@sha256:<DIGEST>
 {
-  manifest_version: "0.1.0",
+  manifest_version: "0.2.0",
   program: {
     // After the publish workflow runs, replace this with the digest form:
     //   ghcr.io/ab-shetty/agentbeats-mle-purple@sha256:<DIGEST>
