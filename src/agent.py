@@ -40,6 +40,11 @@ You will receive:
   - The competition description (Kaggle-style)
   - A listing of the data directory (files / subdirectories)
   - A structured dataset profile with inferred dtypes, null counts, and example values
+  - A target-aware EDA section with target distribution (class balance / numeric summary),
+    top features by mutual information with the target, missing-value co-occurrence patterns,
+    and (when applicable) compound-ID group statistics including target homogeneity
+    per group — use this directly to decide CV strategy (GroupKFold when groups have
+    constant target) and to prioritize feature engineering on high-MI columns
   - The header + first rows of train.csv / test.csv (if tabular)
   - The header of sample_submission.csv
 
@@ -132,6 +137,14 @@ IMAGE (e.g. aerial-cactus, dogs-vs-cats, denoising-dirty-documents, whale):
     unless the dataset is small enough that 5-fold clearly fits the budget.
   - For binary cactus / dogs-vs-cats: BCEWithLogitsLoss + sigmoid → threshold 0.5
     or output the probability if sample_submission.csv expects floats.
+  - Always add cheap test-time augmentation when the submission accepts probabilities:
+    average the model's prediction on the original test image AND its horizontal flip.
+    For binary classification this is ~free and reliably moves AUC / log-loss in the
+    favorable direction. Skip TTA only if you are already against the time budget.
+  - When the schema demands hard labels (0/1), do NOT just threshold at 0.5. Pick the
+    threshold that maximizes the official metric on a held-out split (or out-of-fold
+    predictions). For accuracy/F1, sweep thresholds in [0.3, 0.7] in steps of 0.02
+    on the validation predictions and use the argmax.
   - For denoising-dirty-documents (image-to-image): a tiny U-Net trained for a few
     epochs at 128–256 px works; output PNGs / pixel arrays per the submission spec.
   - Use torch.set_num_threads(4) to bound BLAS.
@@ -143,23 +156,74 @@ OTHER:
 
 
 SYSTEM_PROMPT_DIVERSITY_DIRECTIVE = """SELF-CONSISTENCY DIVERSITY DIRECTIVE:
-This draft is part of a self-consistency ensemble — the goal is UNCORRELATED ERRORS,
-not the strongest single model. The previous successful drafts in this run are
-summarized below. Produce a SUBSTANTIALLY DIFFERENT solution along at least two of
-these axes:
-  - Model family: switch among LightGBM ↔ XGBoost ↔ sklearn HistGradientBoosting ↔
-    ExtraTrees / RandomForest ↔ logistic/linear baselines (tabular);
-    TF-IDF+LogReg ↔ TF-IDF+SVC ↔ char-ngrams ↔ word-ngrams (text);
-    timm backbone ↔ different timm backbone ↔ tiny from-scratch CNN (image).
-  - Feature engineering: different group-by aggregates, different encodings,
-    different text tokenization, different image preprocessing.
-  - CV split: stratified ↔ group-k-fold ↔ holdout, or different fold count.
-A submission that is just a re-tuned version of the previous draft adds NOTHING
-to the ensemble. Genuinely diverge.
+This draft is part of a self-consistency ensemble — the goal is COMPLEMENTARY errors
+through a different model family, while KEEPING the data preparation that already
+worked. The previous successful drafts in this run are summarized below.
+
+WHAT TO CHANGE (pick exactly ONE primary axis):
+  - Model family: switch from LightGBM ↔ XGBoost ↔ sklearn HistGradientBoosting
+    (tabular); TF-IDF+LogReg ↔ TF-IDF+LinearSVC (text); timm backbone ↔ another
+    similarly-sized timm backbone (image). Pick a model the standard CPU stack
+    handles cleanly — do NOT introduce libraries the previous draft did not use.
+
+WHAT TO KEEP (do NOT change unless the previous draft has a clear bug there):
+  - The exact feature pipeline / tokenization / image preprocessing that produced
+    the previous successful draft's CV. Reuse the same encoders, same feature names,
+    same handling of missing values.
+  - The CV split strategy (stratified vs group-k-fold) and the fold count.
+  - The target encoding (boolean → int, label mapping, etc.).
+  - File / path handling that already works.
+
+A draft that swaps the model but reuses the previous draft's feature engineering
+is exactly what we want. A draft that rewrites the feature pipeline AND switches
+the model is too risky — it usually crashes and contributes nothing.
+
 Predictions will be averaged across drafts, so output WELL-CALIBRATED probabilities
 when the submission accepts floats; if the schema demands hard labels, output
 those (we'll majority-vote).
 
+"""
+
+
+SYSTEM_PROMPT_REFINE = """You are a senior Kaggle Grandmaster improving a working ML solution.
+
+You will receive a complete solution.py that already produces a valid submission and
+its measured CV score. Your job is to write an IMPROVED version that pushes CV in the
+favorable direction (HIGHER if higher-is-better, LOWER if lower-is-better) while
+preserving the submission schema.
+
+CONSTRAINTS:
+  - Output ONLY a Python code block delimited by ```python ... ``` and nothing else.
+  - The new script must read os.environ['DATA_DIR'] and write os.environ['OUTPUT_PATH'].
+  - The new script must produce a submission CSV matching sample_submission.csv exactly
+    (same columns, same order, same row count, no NaNs, no infinities).
+  - Print "CV score: <number>" so the harness can compare against the previous draft.
+  - Stay inside the execution budget. If you add cost (more folds, larger backbone, TTA,
+    extra base model), remove or shrink something else to compensate. A timed-out
+    refinement is worse than the prior working draft.
+  - Keep what is clearly working. This is a TARGETED improvement, not a redesign.
+
+WHERE TO ACTUALLY GET LIFT (pick the 1–2 most promising for this dataset, do them well):
+  - Feature engineering (tabular): domain-specific derived columns, group-aware
+    aggregates computed out-of-fold to avoid leakage, target/CatBoost-style encodings
+    for high-cardinality categoricals, interaction features between strong predictors.
+  - Hyperparameters (tabular): a small fixed-trial Optuna or grid search over
+    LightGBM/XGBoost params (num_leaves, learning_rate, min_child_samples,
+    feature_fraction, bagging_fraction, reg_alpha, reg_lambda). Cap trials to fit budget.
+  - Stacking: train a complementary base model (e.g., XGBoost if first was LightGBM,
+    or HistGradientBoosting), generate out-of-fold predictions for both, fit a small
+    Ridge/LogReg meta-learner on stacked OOF preds, predict test the same way.
+  - Image TTA: average the model's prediction on the original test image and its
+    horizontal flip. Cheap, almost always positive.
+  - Threshold calibration: when the schema demands hard labels (0/1 or class names),
+    sweep thresholds on out-of-fold predictions and pick the argmax of the official
+    metric, instead of using 0.5 / argmax-by-default.
+  - CV split: switch StratifiedKFold ↔ GroupKFold ONLY if you can identify a concrete
+    leakage risk (repeated entities, families, sessions). Do not raise fold count
+    blindly — it costs time without proportional gain.
+
+DO NOT regress: if you switch model families entirely, you must justify it in a single
+short comment at the top (e.g., "previous CV plateau at 0.81, switching to XGBoost+stack").
 """
 
 
@@ -293,8 +357,250 @@ class MLEBenchAgent:
             "test_csv": self._csv_profile(self.data_dir / "test.csv"),
             "sample_submission_csv": self._csv_profile(self.data_dir / "sample_submission.csv"),
             "image_layout": self._image_layout_profile(),
+            "target_aware_eda": self._target_aware_eda(),
         }
         return json.dumps(profile, indent=2, sort_keys=True)
+
+    def _target_aware_eda(self, eda_rows: int = 5000) -> dict[str, object]:
+        """Cheap target-aware EDA. Computed once before planning; no LLM in loop.
+
+        Includes:
+          - inferred target column (train ∖ (test ∪ sample_submission))
+          - target distribution (class balance / numeric summary)
+          - top features by signal-to-target (mutual info on a sample)
+          - top missing-value co-occurrence patterns
+          - compound-ID group stats (group sizes + target homogeneity per group)
+          - image class balance from train.csv label column (when present)
+        """
+        result: dict[str, object] = {}
+        train_path = self.data_dir / "train.csv"
+        test_path = self.data_dir / "test.csv"
+        sample_path = self.data_dir / "sample_submission.csv"
+        if not train_path.exists():
+            return {"note": "train.csv not present; target-aware EDA skipped"}
+
+        try:
+            import pandas as pd
+
+            train = pd.read_csv(train_path, nrows=eda_rows)
+        except Exception as e:
+            return {"error": f"could not read train.csv: {e}"}
+
+        # ----- infer target column -----
+        try:
+            test_cols: set[str] = set()
+            if test_path.exists():
+                test_cols = set(pd.read_csv(test_path, nrows=1).columns)
+            # Target = column in train but not in test (sample_submission may
+            # include the target column as the prediction column, so don't
+            # exclude based on it).
+            candidates = [c for c in train.columns if c not in test_cols]
+            # Prefer last column when multiple candidates (Kaggle convention).
+            target_col = candidates[-1] if candidates else None
+        except Exception as e:
+            target_col = None
+            result["target_inference_error"] = str(e)
+        result["inferred_target"] = target_col
+
+        # ----- target distribution -----
+        if target_col and target_col in train.columns:
+            ts = train[target_col].dropna()
+            if len(ts) == 0:
+                result["target_distribution"] = {"note": "all-null target"}
+            else:
+                nunique = int(ts.nunique())
+                if nunique <= 20 or ts.dtype == bool:
+                    counts = ts.value_counts().head(20)
+                    total = int(counts.sum())
+                    result["target_distribution"] = {
+                        "kind": "categorical",
+                        "n_unique": nunique,
+                        "class_counts": {str(self._json_safe(k)): int(v) for k, v in counts.items()},
+                        "majority_baseline": float(counts.max() / total) if total else None,
+                    }
+                else:
+                    result["target_distribution"] = {
+                        "kind": "numeric",
+                        "n_unique": nunique,
+                        "mean": float(ts.mean()),
+                        "std": float(ts.std()),
+                        "min": float(ts.min()),
+                        "p25": float(ts.quantile(0.25)),
+                        "p50": float(ts.quantile(0.5)),
+                        "p75": float(ts.quantile(0.75)),
+                        "max": float(ts.max()),
+                    }
+
+        # ----- top features by signal to target (mutual info) -----
+        if target_col and target_col in train.columns:
+            try:
+                result["top_features_by_signal"] = self._mi_top_features(train, target_col)
+            except Exception as e:
+                result["top_features_by_signal"] = {"error": str(e)}
+
+        # ----- missing-value co-occurrence patterns -----
+        try:
+            null_mask = train.drop(columns=[target_col] if target_col else []).isna()
+            if null_mask.values.any():
+                # Top patterns by frequency.
+                pattern = null_mask.apply(
+                    lambda row: ",".join(sorted(c for c, v in row.items() if v)),
+                    axis=1,
+                )
+                top = pattern.value_counts().head(5)
+                result["missing_patterns"] = [
+                    {"missing_columns": (k or "<none>").split(",") if k else [],
+                     "row_count": int(v)}
+                    for k, v in top.items()
+                ]
+        except Exception as e:
+            result["missing_patterns"] = {"error": str(e)}
+
+        # ----- compound-ID group stats -----
+        try:
+            id_col = self._infer_id_column(sample_path, train)
+            if id_col and id_col in train.columns:
+                group_stats = self._compound_group_stats(train, id_col, target_col)
+                if group_stats:
+                    result["compound_id_groups"] = group_stats
+        except Exception as e:
+            result["compound_id_groups"] = {"error": str(e)}
+
+        # ----- image class balance + label column hint -----
+        if target_col and target_col in train.columns:
+            label_balance = self._image_label_balance(train, target_col)
+            if label_balance:
+                result["image_label_balance"] = label_balance
+
+        return result
+
+    @staticmethod
+    def _mi_top_features(
+        train: object, target_col: str, top_k: int = 10, sample_n: int = 2000,
+    ) -> dict[str, object]:
+        import pandas as pd
+        from sklearn.feature_selection import mutual_info_classif, mutual_info_regression
+
+        df = train.copy()
+        if len(df) > sample_n:
+            df = df.sample(n=sample_n, random_state=0)
+        y_raw = df[target_col]
+        df = df.drop(columns=[target_col])
+        # Drop columns that are obviously identifiers (all-unique strings) or huge text.
+        keep_cols = []
+        for c in df.columns:
+            s = df[c]
+            if s.dtype == object:
+                avg_len = s.dropna().astype(str).str.len().mean()
+                if avg_len is not None and avg_len > 64:
+                    continue  # skip text blobs
+                if s.nunique(dropna=True) > 0.95 * len(s):
+                    continue  # skip likely-id columns
+            keep_cols.append(c)
+        df = df[keep_cols]
+        if df.empty:
+            return {"note": "no usable feature columns after pruning"}
+
+        # Encode: numerics stay; categoricals → integer codes; bools → int.
+        encoded = pd.DataFrame(index=df.index)
+        for c in df.columns:
+            s = df[c]
+            if pd.api.types.is_numeric_dtype(s):
+                encoded[c] = s.fillna(s.median() if s.notna().any() else 0)
+            elif s.dtype == bool:
+                encoded[c] = s.astype(int)
+            else:
+                encoded[c] = s.astype("category").cat.codes  # NaN → -1
+
+        # Decide regression vs classification on target.
+        y = y_raw.loc[encoded.index]
+        if pd.api.types.is_numeric_dtype(y) and y.nunique() > 20:
+            keep_y = y.notna()
+            mi = mutual_info_regression(
+                encoded.loc[keep_y].values, y[keep_y].values, random_state=0,
+            )
+        else:
+            keep_y = y.notna()
+            y_enc = pd.Series(y[keep_y]).astype("category").cat.codes
+            mi = mutual_info_classif(
+                encoded.loc[keep_y].values, y_enc.values, random_state=0,
+            )
+        ranked = sorted(zip(encoded.columns, mi), key=lambda kv: kv[1], reverse=True)
+        top = ranked[:top_k]
+        return {
+            "method": "mutual_info_classif" if not (pd.api.types.is_numeric_dtype(y) and y.nunique() > 20) else "mutual_info_regression",
+            "n_rows_used": int(keep_y.sum()),
+            "top_features": [
+                {"feature": str(c), "score": float(round(s, 5))} for c, s in top
+            ],
+        }
+
+    @staticmethod
+    def _infer_id_column(sample_path: Path, train: object) -> str | None:
+        try:
+            import pandas as pd
+
+            if sample_path.exists():
+                cols = list(pd.read_csv(sample_path, nrows=1).columns)
+                if cols and cols[0] in train.columns:
+                    return cols[0]
+                if cols:
+                    return cols[0]
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _compound_group_stats(
+        train: object, id_col: str, target_col: str | None,
+    ) -> dict[str, object] | None:
+        ids = train[id_col].astype(str)
+        for delim in ("_", "-", "/"):
+            if ids.str.contains(delim, regex=False).mean() < 0.8:
+                continue
+            group = ids.str.split(delim, n=1).str[0]
+            sizes = group.value_counts()
+            stats = {
+                "delimiter": delim,
+                "n_groups": int(sizes.size),
+                "group_size_mean": float(sizes.mean()),
+                "group_size_median": float(sizes.median()),
+                "group_size_max": int(sizes.max()),
+                "rows_in_singleton_groups": int((sizes == 1).sum()),
+            }
+            if target_col and target_col in train.columns:
+                # How homogeneous is target within a group? (proxy for "use GroupKFold")
+                grouped = train.groupby(group)[target_col]
+                try:
+                    n_unique_per_group = grouped.nunique(dropna=True)
+                    stats["mean_target_nunique_per_group"] = float(n_unique_per_group.mean())
+                    stats["pct_groups_with_constant_target"] = float(
+                        (n_unique_per_group <= 1).mean()
+                    )
+                except Exception:
+                    pass
+            return stats
+        return None
+
+    @staticmethod
+    def _image_label_balance(train: object, target_col: str) -> dict[str, object] | None:
+        # If there are <20 unique non-null labels, treat as image-classification class balance.
+        try:
+            import pandas as pd
+
+            s = train[target_col].dropna()
+            if s.dtype == object or pd.api.types.is_integer_dtype(s) or s.dtype == bool:
+                if s.nunique() <= 20:
+                    counts = s.value_counts()
+                    total = int(counts.sum())
+                    return {
+                        "class_counts": {str(k): int(v) for k, v in counts.items()},
+                        "majority_class_pct": float(counts.max() / total) if total else None,
+                        "imbalance_ratio": float(counts.max() / max(counts.min(), 1)),
+                    }
+        except Exception:
+            return None
+        return None
 
     @staticmethod
     def _csv_profile(path: Path, max_rows: int = 3, profile_rows: int = 256) -> dict[str, object]:
@@ -625,6 +931,27 @@ class MLEBenchAgent:
         text = openai_client.complete(SYSTEM_PROMPT_CODER, user, max_output_tokens=12000)
         return self._extract_code(text)
 
+    def _refine_code(self, plan: str, best: StepResult) -> str:
+        direction = "LOWER is better" if self.is_lower_better else "HIGHER is better"
+        user = (
+            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
+            f"PLAN (JSON):\n{plan}\n\n"
+            "COMPETITION DESCRIPTION (truncated):\n"
+            f"{self.description[:6000]}\n\n"
+            "DATA DIR LISTING:\n"
+            f"{self.data_listing}\n\n"
+            "STRUCTURED DATASET PROFILE:\n"
+            f"{self.dataset_profile}\n\n"
+            "SAMPLE SUBMISSION (first lines):\n"
+            f"{self.sample_submission}\n\n"
+            f"CURRENT BEST DRAFT (cv={best.cv_score}, {direction}):\n"
+            f"```python\n{best.code}\n```\n\n"
+            "Improve this solution. Keep the submission schema valid. Print "
+            "\"CV score: <number>\" so we can compare. Do not regress."
+        )
+        text = openai_client.complete(SYSTEM_PROMPT_REFINE, user, max_output_tokens=12000)
+        return self._extract_code(text)
+
     def _repair_code(self, last: StepResult) -> str:
         user = (
             f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
@@ -764,6 +1091,16 @@ class MLEBenchAgent:
             elif category == "ok" and len(valid) < target_n:
                 successful = [r for r, _ in valid]
                 code = self._draft_code(plan, history, diverse_from=successful)
+            elif category == "ok" and len(valid) >= target_n:
+                # Exploration target reached — exploit remaining iters by refining
+                # the current best valid draft.
+                best_result, _ = valid[
+                    max(range(len(valid)), key=lambda j: self._cv_score_for_sort(valid[j][0]))
+                ]
+                logger.info(
+                    "Refinement pass: improving best draft (cv=%s)", best_result.cv_score,
+                )
+                code = self._refine_code(plan, best_result)
             else:
                 # initial draft, or full rewrite after timeout
                 code = self._draft_code(plan, history)
@@ -773,12 +1110,6 @@ class MLEBenchAgent:
             sub_path = self.submissions_dir / f"submission_{i}.csv"
             if result.submission_ok and result.returncode == 0:
                 valid.append((result, sub_path))
-                if len(valid) >= target_n:
-                    logger.info(
-                        "Reached self-consistency target (%d valid drafts); stopping",
-                        target_n,
-                    )
-                    break
 
         if len(valid) >= 2:
             ens_path = self._ensemble(valid)
@@ -827,7 +1158,11 @@ class MLEBenchAgent:
             modality = "other"
         # Per-modality defaults: cheaper modalities get more drafts.
         # Image runs are slow and the 30-min cap makes >1 draft risky.
-        return {"tabular": 4, "text": 3, "image": 1}.get(modality, 1)
+        # Tabular target lowered to 2 (from 4) on 2026-05-03 — at gpt-5-mini's
+        # observed 20-40% diverse-draft success rate, target=4 never lets the
+        # refinement branch fire within MAX_DEBUG_ITERS=5. With target=2 the
+        # remaining iters can refine the best valid draft.
+        return {"tabular": 2, "text": 2, "image": 1}.get(modality, 1)
 
     def _cv_score_for_sort(self, r: StepResult) -> float:
         if r.cv_score is None:
