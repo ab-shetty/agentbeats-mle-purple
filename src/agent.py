@@ -60,8 +60,13 @@ Output a JSON object (and ONLY a JSON object, no prose) with these keys:
                     (e.g. "train.csv with text column 'comment_text'", or
                      "train/<class>/*.jpg + test/*.jpg, label encoded by folder")
   feature_notes:    short bullet list of feature-engineering ideas specific to this dataset
-  model_plan:       short bullet list of model approaches in priority order, with
-                    rough wall-clock guesses (CPU only, using the provided execution budget)
+  model_plan:       short bullet list of model approaches ordered by EXPECTED
+                    LEADERBOARD SCORE — best first. Include only approaches
+                    that fit the provided execution budget on CPU. Each entry
+                    has a rough wall-clock estimate. Do NOT lead with a
+                    classical / hand-crafted baseline just because it is safe;
+                    if a properly-trained model fits the budget and is
+                    expected to score better, that one is `model_plan[0]`.
 
 Be concise. Be correct about column names, metric direction, modality, and
 the actual observed file layout. If image roots are nested, use the detected
@@ -85,6 +90,11 @@ GENERAL CONSTRAINTS:
     Plan training to finish well inside that budget and leave time for inference + writing the CSV.
   - If the previous attempt produced an error or invalid submission, fix the root cause —
     do not just paper over with try/except.
+  - Implement `model_plan[0]` from the planner's JSON. The planner has ranked
+    approaches by expected score within the execution budget — `model_plan[0]`
+    is the best approach that fits, not the safest one. Only fall back to
+    `model_plan[1]` if `model_plan[0]` cannot be reliably implemented in
+    Python with the available libraries within the budget.
 
 AVAILABLE LIBRARIES:
   - Always: pandas, numpy, scikit-learn, lightgbm, xgboost, scipy.
@@ -123,33 +133,41 @@ TEXT (e.g. jigsaw-toxic-comment-classification):
     can fit one epoch in <15 min on CPU (usually you cannot for >50k rows; stick
     with TF-IDF then).
 
-IMAGE (e.g. aerial-cactus, dogs-vs-cats, denoising-dirty-documents, whale):
+IMAGE:
   - Resolve train/test image roots dynamically from the observed dataset profile
     or by searching under DATA_DIR for filenames from train.csv / sample_submission.csv.
-  - Use timm with a pretrained small backbone (e.g. `resnet18`, `mobilenetv3_small_100`,
-    `efficientnet_b0`). Replace the head for the target classes.
-  - Train on CPU with a SMALL image size (e.g. 96–160 px) and 1–3 epochs to stay
-    within budget. Use a DataLoader with num_workers=2 and a sensible batch size (32–128).
-  - If images are tiny (for example 64x64 or smaller), strongly prefer a fast
-    baseline first: raw pixels / HOG / color statistics or a tiny CNN. Only add
-    heavier pretrained feature extraction if the budget comfortably allows it.
-  - For larger CPU datasets, prefer a single holdout split or 3-fold CV over 5-fold
-    unless the dataset is small enough that 5-fold clearly fits the budget.
-  - For binary cactus / dogs-vs-cats: BCEWithLogitsLoss + sigmoid → threshold 0.5
-    or output the probability if sample_submission.csv expects floats.
-  - Always add cheap test-time augmentation when the submission accepts probabilities:
-    average the model's prediction on the original test image AND its horizontal flip.
-    For binary classification this is ~free and reliably moves AUC / log-loss in the
-    favorable direction. Skip TTA only if you are already against the time budget.
-  - When the schema demands hard labels (0/1), do NOT just threshold at 0.5. Pick the
-    threshold that maximizes the official metric on a held-out split (or out-of-fold
-    predictions). For accuracy/F1, sweep thresholds in [0.3, 0.7] in steps of 0.02
-    on the validation predictions and use the argmax.
-  - For denoising-dirty-documents (image-to-image): a tiny U-Net trained for a few
-    epochs at 128–256 px works; output PNGs / pixel arrays per the submission spec.
-  - Use torch.set_num_threads(4) to bound BLAS.
-  - If timm is too slow, fall back to a from-scratch tiny CNN (3 conv blocks)
-    trained briefly — better a finished mediocre submission than a timed-out one.
+  - Use the FULL execution budget. With a multi-hour wall-clock budget, prefer
+    a real model trained properly over a thin baseline. Train for as many
+    epochs as fit; bigger is better up to where validation plateaus. Do not
+    bias toward classical / hand-crafted features just because they are
+    "safe" — they almost always lose to a CNN trained on the actual targets.
+  - For image classification: timm pretrained backbone (`resnet18` /
+    `efficientnet_b0` for tight budgets; `resnet34` / `efficientnet_b3` /
+    `convnext_tiny` when you have ≥30 min). Replace the head; fine-tune the
+    whole model unless data is tiny.
+  - For image-to-image regression / segmentation / denoising (where the
+    target is a per-pixel array): train a small supervised model on the
+    provided pairs (e.g. a small U-Net or DnCNN). Do NOT rely solely on
+    classical filters when paired ground-truth is available — supervised
+    training on pairs almost always wins by a wide margin.
+  - Image size: pick the largest size that fits the per-iter budget given
+    epochs you want to run. 224 px is a safe default for classification;
+    image-to-image tasks may need full-resolution patches (e.g. 256×256) to
+    avoid loss of fine detail.
+  - DataLoader: `num_workers=2`, batch size 32–128 depending on image size.
+    `torch.set_num_threads(4)` to bound BLAS.
+  - CV: prefer a single holdout split when training is expensive; 3-fold
+    when the dataset is small enough that 3 trainings still fit the budget.
+  - For binary classification: BCEWithLogitsLoss + sigmoid → output
+    probabilities when the submission accepts floats; otherwise pick the
+    threshold that maximizes the official metric on held-out predictions
+    (sweep [0.3, 0.7] in 0.02 steps for accuracy/F1).
+  - Test-time augmentation when the submission accepts probabilities: average
+    prediction on the original test image AND its horizontal flip. ~free,
+    reliably moves AUC / log-loss in the favorable direction.
+  - Only fall back to a from-scratch tiny CNN if timm refuses to load — a
+    finished mediocre submission beats a timed-out one, but with the
+    multi-hour cap, timeouts are now rare.
 
 OTHER:
   - Read the description carefully and synthesize a sensible CPU-friendly approach."""
@@ -281,7 +299,13 @@ class MLEBenchAgent:
         self.submissions_dir.mkdir(exist_ok=True)
 
         self.max_iters = int(os.environ.get("MAX_DEBUG_ITERS", "5"))
-        self.subprocess_timeout = int(os.environ.get("SUBPROCESS_TIMEOUT_SEC", "1500"))
+        self.subprocess_timeout = int(os.environ.get("SUBPROCESS_TIMEOUT_SEC", "1800"))
+        # Refinement iters can do TTA / larger backbones and need more headroom
+        # than the initial draft. Default 1.5× subprocess_timeout; override with
+        # REFINE_TIMEOUT_SEC. Ceiling 3600s — Quick Submit accepts ~4h total
+        # so any single iter under 1h is safe.
+        _refine_default = min(int(self.subprocess_timeout * 1.5), 3600)
+        self.refine_timeout = int(os.environ.get("REFINE_TIMEOUT_SEC", str(_refine_default)))
 
         self.description = self._read_text(data_dir / "description.md")
         self.sample_submission = self._read_text(data_dir / "sample_submission.csv", limit_lines=5)
@@ -852,7 +876,10 @@ class MLEBenchAgent:
             "TEST PREVIEW (first lines, may be empty):\n"
             f"{self.test_preview}\n"
         )
-        plan_text = openai_client.complete(SYSTEM_PROMPT_PLANNER, user, max_output_tokens=2000)
+        # 2000 tokens of visible output was tight when reasoning_effort=high
+        # (reasoning ate the budget and the planner returned empty). 6000 is
+        # comfortable for both effort=medium and effort=high.
+        plan_text = openai_client.complete(SYSTEM_PROMPT_PLANNER, user, max_output_tokens=6000)
         # Try to validate JSON; fall back to raw text if it doesn't parse.
         try:
             json.loads(plan_text)
@@ -864,6 +891,12 @@ class MLEBenchAgent:
                 plan_text = stripped
             except Exception:
                 logger.warning("Planner output is not valid JSON; keeping raw text.")
+        if not plan_text.strip():
+            logger.error(
+                "Planner returned empty output (likely token starvation under "
+                "reasoning_effort=high). Downstream is_lower_better and "
+                "modality routing will fall back to defaults.",
+            )
         logger.info("PLAN:\n%s", plan_text)
         return plan_text
 
@@ -934,7 +967,7 @@ class MLEBenchAgent:
     def _refine_code(self, plan: str, best: StepResult) -> str:
         direction = "LOWER is better" if self.is_lower_better else "HIGHER is better"
         user = (
-            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
+            f"EXECUTION BUDGET (seconds): {self.refine_timeout}\n\n"
             f"PLAN (JSON):\n{plan}\n\n"
             "COMPETITION DESCRIPTION (truncated):\n"
             f"{self.description[:6000]}\n\n"
@@ -990,7 +1023,7 @@ class MLEBenchAgent:
             return "schema_bug"
         return "execution_bug"
 
-    def _execute(self, code: str, iter_idx: int) -> StepResult:
+    def _execute(self, code: str, iter_idx: int, timeout: int | None = None) -> StepResult:
         script_path = self.solutions_dir / f"solution_{iter_idx}.py"
         script_path.write_text(code)
         output_path = self.submissions_dir / f"submission_{iter_idx}.csv"
@@ -1000,6 +1033,7 @@ class MLEBenchAgent:
         # Avoid the script trying to use a GPU it doesn't have.
         env.setdefault("CUDA_VISIBLE_DEVICES", "")
 
+        effective_timeout = timeout if timeout is not None else self.subprocess_timeout
         stdout, stderr, rc = "", "", -1
         try:
             proc = subprocess.run(
@@ -1008,11 +1042,11 @@ class MLEBenchAgent:
                 env=env,
                 capture_output=True,
                 text=True,
-                timeout=self.subprocess_timeout,
+                timeout=effective_timeout,
             )
             stdout, stderr, rc = proc.stdout, proc.stderr, proc.returncode
         except subprocess.TimeoutExpired as e:
-            stderr = f"TimeoutExpired after {self.subprocess_timeout}s: {e}"
+            stderr = f"TimeoutExpired after {effective_timeout}s: {e}"
             rc = -2
         except Exception as e:
             stderr = f"Subprocess error: {e}"
@@ -1086,6 +1120,7 @@ class MLEBenchAgent:
             if category is not None:
                 logger.info("Previous iter classified as: %s", category)
 
+            is_refine = False
             if category in {"execution_bug", "schema_bug"}:
                 code = self._repair_code(history[-1])
             elif category == "ok" and len(valid) < target_n:
@@ -1098,26 +1133,31 @@ class MLEBenchAgent:
                     max(range(len(valid)), key=lambda j: self._cv_score_for_sort(valid[j][0]))
                 ]
                 logger.info(
-                    "Refinement pass: improving best draft (cv=%s)", best_result.cv_score,
+                    "Refinement pass: improving best draft (cv=%s, timeout=%ds)",
+                    best_result.cv_score, self.refine_timeout,
                 )
                 code = self._refine_code(plan, best_result)
+                is_refine = True
             else:
                 # initial draft, or full rewrite after timeout
                 code = self._draft_code(plan, history)
 
-            result = self._execute(code, i)
+            iter_timeout = self.refine_timeout if is_refine else self.subprocess_timeout
+            result = self._execute(code, i, timeout=iter_timeout)
             history.append(result)
             sub_path = self.submissions_dir / f"submission_{i}.csv"
             if result.submission_ok and result.returncode == 0:
                 valid.append((result, sub_path))
 
-        if len(valid) >= 2:
-            ens_path = self._ensemble(valid)
+        ens_pool = self._filter_for_ensemble(valid)
+        if len(ens_pool) >= 2:
+            ens_path = self._ensemble(ens_pool)
             if ens_path is not None:
                 ok, err = self._validate_submission(ens_path)
                 if ok:
                     logger.info(
-                        "Using ensemble of %d drafts → %s", len(valid), ens_path.name,
+                        "Using ensemble of %d drafts (filtered from %d) → %s",
+                        len(ens_pool), len(valid), ens_path.name,
                     )
                     return ens_path
                 logger.warning(
@@ -1157,17 +1197,79 @@ class MLEBenchAgent:
         except Exception:
             modality = "other"
         # Per-modality defaults: cheaper modalities get more drafts.
-        # Image runs are slow and the 30-min cap makes >1 draft risky.
         # Tabular target lowered to 2 (from 4) on 2026-05-03 — at gpt-5-mini's
         # observed 20-40% diverse-draft success rate, target=4 never lets the
         # refinement branch fire within MAX_DEBUG_ITERS=5. With target=2 the
         # remaining iters can refine the best valid draft.
-        return {"tabular": 2, "text": 2, "image": 1}.get(modality, 1)
+        # Image bumped 1 → 2 on 2026-05-03 after the actual Quick Submit cap
+        # was found to be ~4h (not 30 min): two image drafts now fit
+        # comfortably, and we observed cases where iter 0 (planner's expected-
+        # best, e.g. supervised CNN) underperformed a tuned classical baseline
+        # on CPU. A second draft on a different model family catches that.
+        return {"tabular": 2, "text": 2, "image": 2}.get(modality, 1)
 
     def _cv_score_for_sort(self, r: StepResult) -> float:
         if r.cv_score is None:
             return float("-inf")
-        return -r.cv_score if self.is_lower_better else r.cv_score
+        # If direction is unknown, default to higher-better but log a warning
+        # once at filter/sort time (filter handles its own warning).
+        return -r.cv_score if self.is_lower_better is True else r.cv_score
+
+    def _filter_for_ensemble(
+        self, valid: list[tuple[StepResult, Path]],
+    ) -> list[tuple[StepResult, Path]]:
+        """Drop drafts whose CV is meaningfully worse than the best draft.
+
+        Averaging a near-baseline draft with a strong draft drags the final
+        submission halfway to baseline. We only ensemble drafts that are
+        within a metric-appropriate epsilon of the best CV.
+
+        Higher-is-better (accuracy / AUC / F1, scores in [0, 1]):
+            keep cv >= best_cv - max(0.005, 0.10 * (1 - best_cv))
+            (tighter near the ceiling: at best=0.999 the gap drops to 0.005,
+             so a 0.991 draft is dropped; at best=0.79 the gap is ~0.021,
+             so a 0.78 draft is kept and a 0.50 draft is dropped.)
+        Lower-is-better (log-loss, RMSE, MAE):
+            keep cv <= best_cv * 1.10  (10% relative slack; protects against
+            noise when best_cv is small, e.g. 0.03 log-loss)
+
+        Drafts with cv_score=None are dropped (we can't judge them).
+        """
+        scored = [(r, p) for r, p in valid if r.cv_score is not None]
+        if len(scored) < 2:
+            return scored if scored else list(valid)
+
+        if self.is_lower_better is None:
+            # Direction unknown — refuse to ensemble; return only the most
+            # recent valid draft (we have no way to rank them).
+            logger.warning(
+                "Ensemble filter: is_lower_better is unknown; cannot rank "
+                "drafts. Returning only the last valid draft.",
+            )
+            return [scored[-1]]
+
+        best_cv = max(self._cv_score_for_sort(r) for r, _ in scored)
+        # Convert sort-space epsilon back into raw-metric comparisons.
+        if self.is_lower_better:
+            # Sort space negates; best_cv (in sort space) corresponds to the
+            # smallest raw value. Allow up to 10% relative slack on raw value.
+            raw_best = -best_cv
+            cap = raw_best * 1.10 if raw_best > 0 else raw_best + 0.01
+            kept = [(r, p) for r, p in scored if r.cv_score <= cap]
+        else:
+            # best_cv here equals raw best (sort space == raw for higher-better).
+            slack = max(0.005, 0.10 * (1.0 - best_cv)) if best_cv <= 1.0 else 0.005
+            cap = best_cv - slack
+            kept = [(r, p) for r, p in scored if r.cv_score >= cap]
+
+        dropped = len(scored) - len(kept)
+        if dropped:
+            logger.info(
+                "Ensemble filter: kept %d/%d drafts (best_cv=%s, lower_better=%s)",
+                len(kept), len(scored), best_cv if not self.is_lower_better else -best_cv,
+                self.is_lower_better,
+            )
+        return kept
 
     def _ensemble(self, valid: list[tuple[StepResult, Path]]) -> Path | None:
         """Combine N valid submissions into one.

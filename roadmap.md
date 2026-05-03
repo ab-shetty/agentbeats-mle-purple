@@ -10,212 +10,188 @@ benchmark (research agent track). User signed up at agentbeats.dev as
 `ashetty21@berkeley.edu`. Target a top-3 finish on at least 4
 per-competition sub-leaderboards.
 
-## Background — important things to know
+There is no aggregate MLE-Bench leaderboard. Each Kaggle competition has its
+**own** sub-leaderboard at
+`github.com/RDI-Foundation/MLE-bench-agentbeats-leaderboard`. Top-3 is per
+competition, ranked by raw score. Active comps: spaceship-titanic,
+aerial-cactus-identification, dogs-vs-cats-redux, right-whale-redux,
+jigsaw-toxic-comment-classification, denoising-dirty-documents.
 
-### 1. There is no aggregate MLE-Bench leaderboard
-Each Kaggle competition has its **own** sub-leaderboard at
-`github.com/RDI-Foundation/MLE-bench-agentbeats-leaderboard`. Active comps:
-spaceship-titanic, aerial-cactus-identification, dogs-vs-cats-redux,
-right-whale-redux, jigsaw-toxic-comment-classification, denoising-dirty-documents.
+## Current scores
 
-Spaceship-titanic has 157/172 logged runs — it's the busy/canonical lane.
-Each result JSON includes `score`, medal thresholds (gold/silver/bronze),
-`is_lower_better`, and medal flags. **Top-3 is per competition**, ranked by
-raw score.
+Sub-leaderboard tops (snapshot 2026-05-01) and our latest submitted /
+best-local-CV per competition.
 
-### Sub-leaderboard snapshot (user-provided, 2026-05-01)
+| Competition | Top score | Lower better? | Submitted (rank) | Best local CV |
+|---|---|---|---|---|
+| aerial-cactus-identification | 0.99995 | no | 0.99592 (8th) | 0.998859 ensemble; 0.999383 single iter |
+| denoising-dirty-documents | 0.01262 | yes | — | 0.180302 (RMSE; ~14× off top) |
+| dogs-vs-cats-redux | — (empty) | yes | 0.03321 (**1st**) | 0.076047 |
+| jigsaw-toxic-comment-classification | 0.98113 | no | — | 0.918476 (smoke only) |
+| spaceship-titanic | 0.83218 | no | 0.81839 (50th) | 0.788105 |
+| icml-2013-whale-challenge | — | — | green-side error: `EOF when reading a line` (likely Kaggle accept-rules `input()` against closed stdin). User cannot accept rules. Blocked. |
 
-Use this for prioritization and difficulty calibration only; do not encode
-hard-coded competition recipes from it into the agent.
+## Environment & contracts
 
-| Sub-leaderboard | Current top / status | Score |
-|---|---:|---:|
-| Aerial Cactus Identification |<redacted-name>, 1st | 0.99995 |
-| Denoising Dirty Documents | <redacted-name>, 1st | 0.01262 |
-| Dogs vs Cats Redux | No results | — |
-| ICML 2013 Whale Challenge | No results; user cannot accept rules | — |
-| Jigsaw Toxic Comment Classification | <redacted-name>, 1st | 0.98113 |
-| Spaceship Titanic | <redacted-name>, 1st | 0.83218 |
-
-### 2. Wire protocol (A2A over HTTP)
-The purple agent serves an A2A endpoint on **port 8080** (hardcoded in the
-official manifest). Source of truth for the contract:
-`https://github.com/RDI-Foundation/mle-bench-green/blob/main/src/agent.py`.
+### A2A wire protocol
+Source of truth: `https://github.com/RDI-Foundation/mle-bench-green/blob/main/src/agent.py`.
 
 Inbound from green:
-- `Message.parts[0]` = `TextPart` containing instructions.txt
+- `Message.parts[0]` = `TextPart` containing instructions.txt.
 - `Message.parts[1]` = `FilePart(FileWithBytes)` of `competition.tar.gz`
-  (extracts to `home/data/{description.md, train.csv, test.csv, sample_submission.csv, ...}`)
+  (extracts to `home/data/{description.md, train.csv, test.csv, sample_submission.csv, ...}`).
 
 Outbound to green:
-- Optional handshake: `TaskStatusUpdateEvent` whose status message text
-  contains `"validate"` AND a `FilePart` of a candidate `submission.csv`.
-  Green replies with a TextPart `"Submission is valid"` or `"Error: ..."`.
+- Optional handshake: `TaskStatusUpdateEvent` whose status message text contains
+  `"validate"` AND a `FilePart` of a candidate `submission.csv`. Green replies
+  `"Submission is valid"` or `"Error: ..."`. **We do not use this today.**
 - Final: `TaskArtifactUpdateEvent` whose artifact has a `FilePart` of
   `submission.csv`. Green base64-decodes `file.bytes` and grades it.
 - Final task state: `TaskState.completed`.
 
-The green's httpx client has `timeout=3600` (1 hour). The Quick Submit GH
-Actions runner additionally enforces `RESULTS_TIMEOUT_MINUTES=30` by default.
+Green's httpx client `timeout=3600` (1h). Quick Submit GH Actions runner has
+a configurable `RESULTS_TIMEOUT_MINUTES` (defaults to 30 in the workflow but
+each leaderboard repo overrides via `vars.QUICK_SUBMIT_TIMEOUT_MINUTES`).
+**For MLE-bench the cap is far higher than 30 min** — see "Walltime cap"
+below.
 
-### 3. Two submission paths into the leaderboard repo (different time caps)
+### Submission paths
+- **Quick Submit (PR-based via agentbeats.dev)** — `quick-submit-runner.yml`.
+  This is the path we target.
+- **Run Scenario (push `scenario.toml` to a fork)** — `run-scenario.yml`,
+  inherits GitHub Actions' ~6 h job default. With Quick Submit's effective
+  cap also in the multi-hour range on MLE-bench, there's little reason to
+  ship a separate "long mode" today.
 
-Confirmed 2026-05-01 by reading the workflows in
-`RDI-Foundation/MLE-bench-agentbeats-leaderboard/.github/workflows/`:
+### Walltime cap (empirical)
+Workflow source has `RESULTS_TIMEOUT_MINUTES` defaulting to `30` but with
+`vars.QUICK_SUBMIT_TIMEOUT_MINUTES` override. Repo variables aren't readable
+via API by non-collaborators, so the *actual* cap on MLE-bench has to be
+inferred from successful run durations. Snapshot 2026-05-03 — most recent 20
+Quick Submit runs on `MLE-bench-agentbeats-leaderboard`:
 
-- **Quick Submit (PR-based, via agentbeats.dev)** — `quick-submit-runner.yml`
-  polls with `deadline=$((SECONDS + 60 * RESULTS_TIMEOUT_MINUTES))`, default
-  **30 min** (overridable per-leaderboard via `vars.QUICK_SUBMIT_TIMEOUT_MINUTES`,
-  but submitters cannot change it). This is the path we've been targeting.
-- **Run Scenario (push `scenario.toml` to a fork)** — `run-scenario.yml` runs
-  `docker compose up --abort-on-container-exit` with **no explicit timeout**,
-  so it inherits GitHub Actions' default ~6 h job limit. Some leaderboard
-  entries (e.g.
-  `https://github.com/RDI-Foundation/MLE-bench-agentbeats-leaderboard/actions/runs/25197385191`)
-  show 3 h+ durations — those are using this path, not Quick Submit.
+| Duration | Conclusion |
+|---:|---|
+| 4–13 min | mix of pass / fail (small tasks or early failure) |
+| 29 min | success |
+| 84, 86 min | success |
+| 202–213 min | success (3 separate runs, ~3.5h each) |
+| 263 min | success (~4.4h) |
 
-Implication: there's a "short mode" tuned for the 30-min Quick Submit cap and a
-potential "long mode" for the un-capped fork-push path. Today we ship short
-mode only.
+Working assumption: **MLE-bench Quick Submit accepts at least 4 hours, likely
+6 hours.** Our prior "30-min cap → short-mode" framing was based on the
+workflow default, not the leaderboard's actual override. We were leaving
+~90% of the available budget on the table.
 
-### 4. Grading runner is CPU-only with a 30-min walltime cap (short mode)
+### Grading runner (Quick Submit)
+- `runs-on: ubuntu-latest`: 4 vCPU, 16 GB RAM, ~14 GB disk, **no GPU**.
+- Total agent runtime is roughly
+  `MAX_DEBUG_ITERS × SUBPROCESS_TIMEOUT_SEC + OpenAI calls + tarball IO +
+  setup overhead (image pull, container start, ~3-5 min)`. With a ~4h cap
+  there is plenty of room for proper training; the limiting factor is now
+  per-iter wall time, not total iterations.
+- Sensible per-modality defaults (set in the AgentBeats config block of the
+  manifest if you want to override the runtime defaults below):
+  - Tabular: `MAX_DEBUG_ITERS=5, SUBPROCESS_TIMEOUT_SEC=900` (15 min/iter).
+    LightGBM + XGBoost + MLP fit comfortably in 5–10 min.
+  - Image: `MAX_DEBUG_ITERS=4, SUBPROCESS_TIMEOUT_SEC=1800,
+    REFINE_TIMEOUT_SEC=2700` (30 min initial, 45 min refinement). Enough to
+    train a real CNN for a few epochs at 224 px.
+  - Text: `MAX_DEBUG_ITERS=4, SUBPROCESS_TIMEOUT_SEC=1500`. TF-IDF + LR is
+    minutes; a transformer fine-tune fits if the dataset is small.
 
-For the Quick Submit path:
-- `runs-on: ubuntu-latest` → standard GitHub-hosted runner (4 vCPU, 16 GB RAM,
-  ~14 GB disk, **no GPU**).
-- The 30 minutes covers everything: image pulls, container start, green
-  agent shipping the tarball over A2A, our agent's full plan/code/run loop,
-  schema validation, and results capture. Realistic agent-only budget after
-  pulls + transfer of an 800 MB-class dataset is closer to **20–25 min**.
-- Total agent runtime budget is
-  `MAX_DEBUG_ITERS × SUBPROCESS_TIMEOUT_SEC + OpenAI calls + tarball IO`.
-  Bumping per-iter timeout without lowering iter count busts the cap.
-  Sensible per-modality defaults:
-  - Tabular: `MAX_DEBUG_ITERS=3, SUBPROCESS_TIMEOUT_SEC=300`.
-  - Image (e.g. dogs-vs-cats, aerial-cactus): `MAX_DEBUG_ITERS=2,
-    SUBPROCESS_TIMEOUT_SEC=700`. One full draft + one repair pass.
-  - Set these per-competition in the AgentBeats config block of the manifest.
-
-### 5. Image / manifest contract
-Image must be `linux/amd64`, pushed to GHCR, package made public.
-Manifest expects port 8080 and a single A2A endpoint. The user's
-`OPENAI_API_KEY` is passed via `${config.openai_api_key}` (mark `secret: true`).
-`OPENAI_MODEL` can now be overridden at submission time via
-`${config.openai_model}`; when omitted, runtime default remains `gpt-5-mini`.
-Pin to digest at submission time (`@sha256:...`).
-
-## Submitted results so far (Quick Submit, agentbeats.dev)
-
-As of 2026-05-01:
-
-| Competition | Rank | Score | Total duration |
-|---|---:|---:|---:|
-| spaceship-titanic | 50th | 0.81839 | 6m 31s |
-| aerial-cactus-identification | 8th | 0.99592 | 10m 41s |
-| dogs-vs-cats-redux-kernels-edition | **1st** | 0.03321 | 29m 9s |
-| icml-2013-whale-challenge | — | — | green-side error (see below) |
-
-Notes:
-- Dogs-vs-cats placed 1st on an empty sub-leaderboard. The 29m 9s total
-  duration ran right against the 30-min Quick Submit cap.
-- Whale-challenge run aborted on the green with
-  `Failed to prepare competition data: EOF when reading a line`. This is a
-  green-side bug — almost certainly `input()` (likely the Kaggle
-  accept-rules prompt) being called against a closed stdin. Nothing the
-  purple can do; waiting on green-side fix or pre-accepted rules. Matches
-  the snapshot note that the user cannot accept rules for this competition.
+### Image / manifest
+- Image must be `linux/amd64`, pushed to GHCR, package set Public.
+- Manifest expects port 8080 and a single A2A endpoint.
+- `OPENAI_API_KEY` passed via `${config.openai_api_key}` (`secret: true`).
+- `OPENAI_MODEL`, `MAX_DEBUG_ITERS`, `SUBPROCESS_TIMEOUT_SEC`,
+  `REFINE_TIMEOUT_SEC`, `REASONING_EFFORT` are config knobs.
+- Pin to digest at submission time (`@sha256:...`).
+- `a2a-sdk` pinned `>=0.3.20,<1.0` — pip's resolver picks `1.0.x` by default
+  which has a breaking API change (no `a2a.server.apps`). Don't bump unless
+  you also rewrite the imports.
+- `A2A_MAX_CONTENT_LENGTH` raised from 10 MiB SDK default to 512 MiB; for
+  840 MB dogs-vs-cats tarball use 2 GiB locally.
 
 ## What is built
 
-| Path | Status | Notes |
-|---|---|---|
-| `src/server.py` | ✅ | A2A Starlette app, port 8080, agent card. Honors `A2A_MAX_CONTENT_LENGTH` (default 512 MiB) for large tarballs. |
-| `src/executor.py` | ✅ | Extracts tarball to a workspace, calls agent, emits FilePart artifact. |
-| `src/agent.py` | ✅ | Plan → Code → Execute → Debug loop. Universal: tabular / text / image / other, modality-branched coder prompt. Includes structured dataset profiling (dtypes/nulls/example values), stronger tabular leakage/dtype guidance, repair flow for execution / schema bugs, self-consistency with ensembling for cheap modalities, **CV-feedback refinement loop** (after target_n diverse drafts succeed, remaining iters refine the best one in-place via `SYSTEM_PROMPT_REFINE` — covers HP search, stacking, TTA, threshold calibration), and **TTA + threshold-sweep guidance** in the IMAGE coder prompt. |
-| `src/openai_client.py` | ✅ | Responses API wrapper, model from `OPENAI_MODEL` env. |
-| `scripts/local_test.py` | ✅ | Mocked-green driver. Sends instructions+tar, captures artifact. |
-| `scripts/fetch_spaceship_titanic.sh` | ✅ | Kaggle CLI wrapper + writes `description.md`. |
-| `scripts/fetch_dogs_vs_cats.sh` | ✅ | Kaggle CLI wrapper for `dogs-vs-cats-redux-kernels-edition`; supports new `KAGGLE_API_TOKEN` env var auth. |
-| `Dockerfile` | ✅ | python:3.12-slim + CPU torch wheels (separate layer), exposes 8080. |
-| `amber-manifest.json5` | ✅ | Image ref placeholder — update before submit. |
-| `requirements.txt` | ✅ | a2a-sdk pinned `>=0.3.20,<1.0`; openai, pandas, numpy, sklearn, lightgbm, xgboost, timm, transformers, pillow, opencv-headless, kaggle. |
-
-## What is NOT done yet
-
-1. **Validation handshake unused.** The agent does NOT currently negotiate
-   schema with the green via the `"validate"` message. Adding that would
-   catch malformed submissions before final grading. Path: in `executor.py`,
-   between iterations, send a status update with text `"validate"` + a
-   `FilePart` of the candidate CSV. The current driver in `scripts/local_test.py`
-   does not implement validation either. **Lift in difficulty: medium.**
-2. **Quality tuning of prompts.** The current planner/coder system prompts
-   are reasonable defaults but were not iterated against actual leaderboard
-   scores. Keep prompt improvements generic and task-derived: the agent should
-   infer feature engineering and model choices from `description.md`, file
-   layout, data previews, and `sample_submission.csv`, rather than receiving
-   hard-coded competition recipes.
-3. **No "long mode" for the fork-push Run Scenario path.** Today we tune for
-   the 30-min Quick Submit cap. A long-mode profile (bigger iter budget,
-   EfficientNet-B3+, 5-fold + TTA) gated by an env var would let the same
-   image compete on the un-capped path for heavier comps. See "Where to push
-   next" #4.
-4. **Self-consistency quality is not yet leaderboard-proven.** The mechanism
-   now works end-to-end locally, but the latest spaceship-titanic smoke
-   (`cv=0.813758`, `cv=0.810192`, valid ensemble artifact) did NOT exceed the
-   user's existing leaderboard result of `0.81839`. Reliability improved;
-   competitive lift is still unproven.
-
-## Verified locally
-
-- All five Python files compile under Python 3.12.
-- Requirements installed under the local Python 3.13 environment
-  (`pip` is bound to Python 3.13; `/usr/bin/python` is Python 3.8 and cannot run
-  this code).
-- Server boots and serves `/.well-known/agent-card.json` on port 8080.
-- A2A large-payload cap was raised from the SDK default 10 MiB to 512 MiB
-  (`A2A_MAX_CONTENT_LENGTH`); for the 840 MB dogs-vs-cats tarball we run
-  local with 2 GiB.
-- `a2a-sdk` version pin is critical: pip's resolver picks `1.0.x` by default,
-  which has a breaking API change (no `a2a.server.apps`). `requirements.txt`
-  pins `>=0.3.20,<1.0` — keep it that way unless you also rewrite the imports.
-- Smoke / full-data runs (chronological):
-  - `jigsaw-toxic-comment-classification-challenge-smoke`: valid 3000-row
-    submission in 164.7s; `cv=0.918476`.
-  - `denoising-dirty-documents-smoke`: valid 278640-row submission in 104.3s;
-    `cv=0.142267`.
-  - `aerial-cactus-identification-smoke`: 85.4s pre-2026-05-01; 42.6s after
-    the structured dataset profile + budget-aware image guidance.
-  - `aerial-cactus-identification` full data: planner correctly inferred
-    nested image roots. With `MAX_DEBUG_ITERS=2`, agent self-corrected past
-    an OpenCV dtype bug and produced a valid 4000-row submission in 455.0s
-    (`cv=0.9576`, then `cv=0.959771`). Control loop subsequently fixed to
-    stop after the first clean submission.
-  - `dogs-vs-cats-redux-kernels-edition` full data (post-repair): with
-    `MAX_DEBUG_ITERS=2`, `SUBPROCESS_TIMEOUT_SEC=700`, iter 1 produced a
-    valid 12,500-row submission in 532.8s (`cv=0.076047` log-loss).
-  - `spaceship-titanic` post-repair regression: iter 1 succeeded with
-    `cv=0.757` in 144s; first-draft path is unchanged from pre-refactor, so
-    the lower CV vs prior 0.811 baseline is model variance + GroupKFold-by-
-    family being more rigorous than the prior StratifiedKFold.
-  - `spaceship-titanic` self-consistency smoke (2026-05-02): with
-    `SELF_CONSISTENCY_N=2`, `MAX_DEBUG_ITERS=5`, `SUBPROCESS_TIMEOUT_SEC=300`,
-    the planner correctly recognized `Transported` as boolean and called for
-    group-aware validation from `PassengerId`. Draft 1 succeeded with
-    `cv=0.813758`; draft 2 initially failed to create a submission, then the
-    repair flow recovered it to `cv=0.810192`. Agent returned a valid ensemble
-    artifact in 188.2s with correct submission schema. This validates the
-    self-consistency control path mechanically, but not as a leaderboard gain
-    versus the existing `0.81839` submission.
+| Path | Notes |
+|---|---|
+| `src/server.py` | A2A Starlette app, port 8080, agent card. Honors `A2A_MAX_CONTENT_LENGTH`. |
+| `src/executor.py` | Extracts tarball to workspace, calls agent, emits FilePart artifact. |
+| `src/agent.py` | Plan → Code → Execute → Debug loop. Universal modality branching (tabular / text / image / other). Includes: structured dataset profiling, target-aware EDA (MI scores, missing-value patterns, group-target purity for GroupKFold detection, image class balance), tabular leakage/dtype guidance, repair flow, self-consistency with diversity directive, refinement loop (after `target_n` valid drafts, remaining iters refine the best in-place), CV-based ensemble filter, separate `REFINE_TIMEOUT_SEC` for refinement iters. |
+| `src/openai_client.py` | Responses API wrapper, `OPENAI_MODEL` env. |
+| `scripts/local_test.py` | Mocked-green driver. |
+| `scripts/fetch_*.sh` | Kaggle CLI wrappers for spaceship-titanic, dogs-vs-cats. |
+| `scripts/run_eval_quick.sh`, `run_eval_sweep.sh` | Local eval drivers. |
+| `Dockerfile` | python:3.12-slim + CPU torch wheels (separate layer), exposes 8080. |
+| `amber-manifest.json5` | Image ref placeholder — update before submit. |
+| `requirements.txt` | a2a-sdk pinned `>=0.3.20,<1.0`; openai, pandas, numpy, sklearn, lightgbm, xgboost, timm, transformers, pillow, opencv-headless, kaggle. |
 
 ## Open questions for the user
 
-1. **Whether to implement the validation handshake** (see "What is NOT done
-   yet" #1). Costs ~half a day; reduces the chance of a 0-score submission
-   from a schema bug.
-2. **Whether to invest in a "long mode" profile** for the fork-push Run
-   Scenario path. Pays off most on heavier image / multi-modal comps.
+1. **Implement the validation handshake?** (~half day.) In `executor.py`,
+   between iterations send `TaskStatusUpdateEvent` with text `"validate"` +
+   `FilePart` of candidate CSV; wait for green's `"Submission is valid"` /
+   `"Error: ..."`. Reduces 0-score risk from schema bugs.
+2. ~~Invest in a "long mode" profile for the fork-push Run Scenario path?~~
+   **Moot as of 2026-05-03** — Quick Submit accepts ~4h runs already (see
+   "Walltime cap" above). Same code can do "long mode" through Quick Submit
+   by raising the config-level budgets.
 
-## How to test (10-minute smoke test)
+## Next priorities (ranked)
+
+1. **Tabular: improve spaceship-titanic.** Currently 50th @ 0.81839; top
+   0.83218. Likely lifts: better CV strategy (the new EDA already produces
+   GroupKFold from `pct_groups_with_constant_target`), richer feature
+   engineering from `description.md`, ensembling LightGBM + XGBoost + small
+   MLP. Keep recipes generic / task-derived.
+2. **Image: re-submit aerial-cactus.** Local CV 0.998859 ensemble of 4
+   refined drafts beats current submitted 0.99592 (8th). Free climb if a
+   leaderboard re-submission goes through.
+3. **Refinement prompt: allow approach switching.** Today `_refine_code`
+   biases toward tweaking the current solution. When the current approach
+   plateaus or regresses (see denoising 0.180 → 0.21 → 0.26 → 0.29), the right
+   move is often to switch to a different `model_plan` entry. Pass the full
+   `model_plan` into the refine prompt; permit swapping when the last
+   refinement regressed. Generic / task-derived — no competition recipes.
+4. **Image: re-test denoising at high budget.** With ~4h cap (not 30 min), a
+   real supervised CNN trained on the 144 (noisy, clean) pairs is feasible.
+   Aim for the leaderboard top of 0.01262 RMSE.
+5. **Implement the validation handshake** (see open question 1).
+6. **Stacking meta-learner in `_ensemble`.** Currently averages numeric
+   columns, majority-votes the rest. Have refined drafts emit OOF predictions
+   to a known path so a Ridge/LogReg meta-learner can stack them.
+7. **Tune self-consistency / draft success rate.** The filter + refinement
+   mechanisms work; the limiting factor on tabular is now that often only 1
+   valid draft survives the iter budget, so the filter and ensemble never
+   really engage.
+
+## Submission flow
+
+GitHub user `ab-shetty` (Kaggle: `abhishek1shetty`).
+Repo: `agentbeats-mle-purple` → image `ghcr.io/ab-shetty/agentbeats-mle-purple`.
+
+1. **Push to GitHub.** Publish workflow auto-builds + pushes to GHCR on every
+   push to main (linux/amd64).
+2. **Make the package public** (one-time) at
+   `https://github.com/ab-shetty?tab=packages`.
+3. **Update `amber-manifest.json5`** with the pinned digest from the workflow
+   job summary (`ghcr.io/ab-shetty/agentbeats-mle-purple@sha256:<DIGEST>`).
+   Commit + push.
+4. **Submit on agentbeats.dev** via Quick Submit:
+   - Manifest URL:
+     `https://raw.githubusercontent.com/ab-shetty/agentbeats-mle-purple/main/amber-manifest.json5`.
+   - Pick the MLE-Bench leaderboard + a competition.
+   - Paste the encrypted `openai_api_key` secret.
+   - Optional Config JSON. With the empirical ~4h cap, sensible per-modality
+     starting points (override what the runtime defaults set):
+     - Image: `{"max_debug_iters":"4","subprocess_timeout_sec":"1800","refine_timeout_sec":"2700","reasoning_effort":"high"}`
+     - Tabular: `{"max_debug_iters":"5","subprocess_timeout_sec":"900","refine_timeout_sec":"1200","reasoning_effort":"high"}`
+     - Text: `{"max_debug_iters":"4","subprocess_timeout_sec":"1500","refine_timeout_sec":"2100","reasoning_effort":"high"}`
+   - Runner forks the leaderboard repo, opens a PR, writes the result JSON.
+
+## How to test (10-min local smoke)
 
 Once dataset is in `./data/spaceship-titanic/`:
 
@@ -230,207 +206,181 @@ python -m src.server --host 127.0.0.1 --port 8080
 python scripts/local_test.py --data-dir ./data/spaceship-titanic
 ```
 
-This is a smoke-test profile, not the code defaults. Current code defaults are
-`MAX_DEBUG_ITERS=5` and `SUBPROCESS_TIMEOUT_SEC=1500`; for a 10-minute local
-check, override them as above.
-
-Expectation with the smoke-test profile (3 iterations, 300s timeout each):
-- Total run time 4–8 minutes (most spent in OpenAI calls).
-- Final `submission.csv` matches `sample_submission.csv` schema.
-- LightGBM CV accuracy ~0.75–0.81 on 5-fold (varies with seed and CV strategy).
-- Public score lands around bronze threshold (~0.810) on spaceship-titanic.
+Code defaults are `MAX_DEBUG_ITERS=5` and `SUBPROCESS_TIMEOUT_SEC=1500` — for
+a 10-min check, override as above. Expect 4–8 min total, LightGBM CV
+~0.75–0.81, public score around bronze (~0.810).
 
 If it fails:
 - Check `agent.py` logs for which iteration crashed.
-- The generated `solution_*.py` files live in `WORKSPACE_DIR/run_<id>/solutions/`.
-- The generated CSVs live in `WORKSPACE_DIR/run_<id>/submissions/`.
+- Generated `solution_*.py` live in `WORKSPACE_DIR/run_<id>/solutions/`.
+- Generated CSVs live in `WORKSPACE_DIR/run_<id>/submissions/`.
 
-## Submission flow (user does these)
+For multi-comp eval: `scripts/run_eval_quick.sh` (spaceship + cactus, ~25 min).
 
-GitHub user is `ab-shetty` (Kaggle username is `abhishek1shetty`). Repo name:
-`agentbeats-mle-purple` → image `ghcr.io/ab-shetty/agentbeats-mle-purple`.
+## Changelog
 
-Already done once (the four submitted results above came through this flow).
-To re-submit after agent changes:
+### 2026-05-03 — high-budget denoising re-test + bug fixes
+Two runs on `denoising-dirty-documents` with the new high-budget defaults
+(`MAX_DEBUG_ITERS=4`, `SUBPROCESS_TIMEOUT_SEC=1800`,
+`REFINE_TIMEOUT_SEC=2700`, `REASONING_EFFORT=high`).
 
-1. **Push to GitHub.** The publish workflow auto-builds + pushes the image
-   to `ghcr.io/ab-shetty/agentbeats-mle-purple` on every push to main
-   (linux/amd64).
-2. **Make the package public** (one-time): open
-   `https://github.com/ab-shetty?tab=packages`, switch visibility to
-   **Public** so the AgentBeats runner can pull without auth.
-3. **Update `amber-manifest.json5`** with the pinned digest from the
-   workflow's job summary
-   (`ghcr.io/ab-shetty/agentbeats-mle-purple@sha256:<DIGEST>`). Commit + push.
-4. **Submit on agentbeats.dev** via Quick Submit:
-   - Manifest URL:
-     `https://raw.githubusercontent.com/ab-shetty/agentbeats-mle-purple/main/amber-manifest.json5`
-   - Pick the MLE-Bench leaderboard + a competition.
-   - Paste the encrypted `openai_api_key` secret.
-   - Optional Config JSON, e.g.
-     `{"openai_model":"gpt-5.2","reasoning_effort":"high"}`
-   - The runner forks the leaderboard repo, opens a PR, and writes the
-     result JSON.
+Run 1 (`eval_runs/20260503T051203Z_denoising_high/`, 1035s): cv=**0.085307**
+on iter 1. Big jump over the 0.180 from the small-budget run. But two bugs
+found:
+- Planner returned **empty output** under `reasoning_effort=high` —
+  `max_output_tokens=2000` was eaten by reasoning. Without a plan,
+  `is_lower_better` stayed `None`.
+- `_filter_for_ensemble` and `_cv_score_for_sort` treated
+  `is_lower_better=None` as falsy → silent higher-better assumption. Filter
+  kept the worse 0.116 draft alongside the 0.085 best, and the refinement
+  loop kept telling iter 2 it was the "best" because sort negation never
+  fired.
 
-## Where to push next for top-3
+Bug fixes shipped in same commit:
+- Planner `max_output_tokens` 2000 → 6000.
+- `_filter_for_ensemble`: returns just the last valid draft and warns when
+  `is_lower_better is None`.
+- `_cv_score_for_sort`: requires `is_lower_better is True` before negating.
 
-0. **[NEXT] Filter weak drafts in `_ensemble`.** Highest-leverage outstanding
-   fix as of 2026-05-03 quick validation. Both spaceship and cactus runs ended
-   with a strong best draft AND a weaker draft, and mean/majority-vote
-   ensembling pulled the final output down (spaceship: cv=0.78/0.79 averaged
-   with cv=0.496 ≈ majority baseline; cactus: cv=0.999 averaged with cv=0.991
-   refinement-after-timeout). Cactus iter 0 alone scored 0.999383 — above the
-   prior leaderboard top of 0.99995 — so unblocking the ensemble would
-   immediately benefit both leaderboards. Implementation: in
-   `MLEBenchAgent._ensemble`, before stacking columns, filter `valid` to drafts
-   whose CV is within `epsilon` of the best CV (epsilon ≈ 0.01 for accuracy/AUC;
-   larger floor for log-loss; or fall back to "drop drafts worse than majority
-   baseline + small margin" when `is_lower_better` is False and we know the
-   baseline). Keep the single-best-draft fallback already present for when only
-   one draft survives the filter. ≤30 lines. Re-run `scripts/run_eval_quick.sh`
-   to validate the ensemble lift cleans up.
-1. **Improve spaceship-titanic ranking (currently 50th, 0.81839).** Tabular
-   lane has the most-tuned competition. Likely lifts: better CV strategy,
-   richer feature engineering from `description.md`, ensembling LightGBM +
-   XGBoost + small MLP. Keep recipes generic / task-derived.
-2. **Improve aerial-cactus ranking (currently 8th, 0.99592).** Score is
-   close to ceiling (top is 0.99995); marginal gains from TTA, larger
-   backbone within the 700s per-iter budget, threshold calibration.
-3. **Implement the validate handshake** (see § "What is NOT done yet" #1).
-4. **Add a "long mode" profile for the fork-push path.** Env-var-gated:
-   bigger `MAX_DEBUG_ITERS`, larger backbones, 5-fold + TTA. Same image,
-   different config, lets us compete on heavier comps without busting the
-   30-min Quick Submit cap.
-5. **Tune self-consistency / ensembling, do not just add it.** The mechanism
-   is now implemented and mechanically works, but next work is to improve its
-   draft success rate and only enable it where it is score-positive within the
-   30-minute budget.
-6. **Validate the refinement loop on real leaderboard runs.** Added 2026-05-02:
-   after `target_n` diverse drafts succeed, remaining iters call `_refine_code`
-   on the current best valid draft. The refined drafts are added to `valid` and
-   participate in the ensemble. Image runs benefit most from this since
-   `target_n=1` for image — every iter after the first is a refinement pass.
-   Verify lift on spaceship-titanic (currently 38th @ 0.82069, top 0.83218) and
-   aerial-cactus (9th @ 0.99915, top 0.99995) before declaring success.
-7. **Stacking meta-learner in `_ensemble`.** Currently averages numeric columns
-   and majority-votes the rest. Next step: have refined drafts emit OOF
-   predictions to a known path so a Ridge/LogReg meta-learner can stack them
-   instead of plain averaging.
+Run 2 with bug fixes (`eval_runs/20260503T053122Z_denoising_high/`, 3793s):
+- Planner correctly emitted JSON; `model_plan[0]` was a small U-Net trained
+  on (noisy, clean) pairs (the planner reframe is working).
+- Coder implemented the U-Net.
+- Iter 0: U-Net at 25 min CPU → cv=**0.288932** (worse than the prior tuned
+  classical run's 0.085).
+- Iters 1, 3 failed; iter 2 reproduced 0.288. Ensemble of 2 (both 0.288).
 
-## 2026-05-03 — refinement-loop sweep results (gpt-5-mini)
+**Lesson — planner can't accurately predict CPU performance.** "Best by
+expected score" ranked U-Net over classical, but on this hardware × dataset
+(144 train pairs, ~25 min CPU) a tuned classical baseline (NL-Means with
+per-image h-search + linear regressor on noise-stat features) was actually
+better. Mitigation in same commit: bumped image `target_n` from 1 → 2 in
+`_self_consistency_target` so a diverse-family second draft can catch this.
 
-Local sweep, 4 runs, captured in `eval_runs/20260502T235557Z/`:
+### 2026-05-03 — discovered actual Quick Submit cap is ~4h, not 30 min
+Empirical: the most recent 20 Quick Submit runs on
+`MLE-bench-agentbeats-leaderboard` include multiple successes at 84, 86,
+202, 207, 212, 213, and 263 minutes. The workflow's `RESULTS_TIMEOUT_MINUTES`
+defaults to `30` but the leaderboard repo has overridden
+`vars.QUICK_SUBMIT_TIMEOUT_MINUTES` to a much higher value (probably ~360 min,
+matching GitHub Actions' default 6h job cap).
 
-| Competition | Run | Valid drafts | Best CV | Outcome |
-|---|---|---|---|---|
-| spaceship-titanic | 1 | 1/5 | 0.7916 | best single |
-| spaceship-titanic | 2 | 2/5 | 0.8075 | ensemble of 2 |
-| spaceship-titanic | 3 | **0/5** | — | **fallback to sample_submission** |
-| aerial-cactus | 1 | 3/3 | 0.997057 | refined ×2 + ensemble |
+Implications:
+- Our previous "short-mode-only, tune for 30 min" framing was wrong; we were
+  using ~10% of available wall-clock.
+- The "long mode for fork-push" plan is moot — Quick Submit *is* long mode.
+- Image and text modalities can now train real models (CNN multi-epoch,
+  transformer fine-tune on small data), not just thin baselines.
+- Per-modality default budgets bumped (see "Grading runner" above and
+  manifest config examples in the submission flow).
 
-**Refinement loop works on image.** Cactus: iter0=0.993054 → refine1=**0.997057**
-(+0.004 CV) → refine2=0.995817. The IMAGE branch's TTA + threshold-sweep prompt
-plus the new `_refine_code` step combined to produce a real CV gain on the
-first try. With image `target_n=1`, every iter after the first is a refinement
-pass — exactly the intended path.
+Code defaults raised in this commit (`src/agent.py`):
+- `SUBPROCESS_TIMEOUT_SEC` default: 1500 → 1800.
+- `MAX_DEBUG_ITERS` default: 5 → 5 (unchanged; per-iter timeout is the lever).
+- `REFINE_TIMEOUT_SEC`: stays `min(1.5 × SUBPROCESS_TIMEOUT_SEC, 1800)`
+  formula, but the `1800` ceiling lifted to `3600`.
 
-**Refinement loop never fired on tabular.** Spaceship runs reached only 0–2 of
-the `target_n=4` valid drafts before iter budget exhausted, so the run loop
-stayed in the diversify-and-explore branch the whole time and never hit the
-exploit branch. Best run still landed at 0.808 (vs baseline 0.811 / leaderboard
-0.82069); run 3 produced **zero** valid drafts and fell back.
+### 2026-05-03 — denoising-dirty-documents end-to-end
+`eval_runs/20260503T043817Z_denoising/`. `MAX_DEBUG_ITERS=4`,
+`SUBPROCESS_TIMEOUT_SEC=600`, `REFINE_TIMEOUT_SEC=900`.
 
-Two compounding causes diagnosed from `solutions/solution_*.py` files in
-`/tmp/purple_workspace/`:
-- The `SYSTEM_PROMPT_DIVERSITY_DIRECTIVE` ("SUBSTANTIALLY DIFFERENT… switch
-  model families, switch feature engineering, switch CV split") pushes
-  gpt-5-mini into less-tested code paths that crash. Observed failure modes:
-  pandas `Categorical.add_categories` collisions, sklearn API misuse,
-  group-aware CV with empty groups.
-- The repair flow's "minimum diff" guidance keeps a buggy approach alive
-  across iters; once a draft fails, repair often re-introduces a different
-  bug and burns the iter budget.
+| Iter | CV (RMSE) | Path |
+|---|---|---|
+| 0 | **0.180302** | initial draft |
+| 1 | 0.20778 | refinement regressed |
+| 2 | 0.256561 | refinement regressed |
+| 3 | 0.286462 | refinement regressed |
 
-**Next concrete fix.** Lower tabular `target_n` from 4 → 2 in
-`_self_consistency_target` so 3 of the 5 iters are available for refinement
-even when only 2 explores succeed. Also soften `SYSTEM_PROMPT_DIVERSITY_DIRECTIVE`
-to ask for *complementary* (not "substantially different") models, and require
-the diverse draft to keep a known-good feature pipeline if the previous draft
-succeeded with one. Validate by re-running the same sweep and confirming the
-spaceship runs reach the refinement branch.
+Filter kept 1/4 (only iter 0 within `best * 1.10 = 0.198` for lower-better) →
+fell through to best_single → returned iter 0's 14.23M-row submission. Total
+1001s. **First live engagement of `_filter_for_ensemble`** — without it,
+naive averaging of all 4 would have produced ~0.23 RMSE.
 
-## 2026-05-03 — tabular tuning + richer EDA profile
+CV 0.180 is ~14× off the leaderboard top of 0.01262. Iter 0 picked the
+cheapest `model_plan` option (classical Gaussian background subtract +
+fastNlMeans + median + morphological + blend); refinements stayed inside that
+classical pipeline instead of climbing to plan option 2 (supervised CNN on
+`(noisy, clean)` pairs). Motivates next-priority #3 (refinement prompt should
+allow approach switching).
 
-Two fixes shipped after the sweep diagnosis above:
+### 2026-05-03 — refinement budget knob shipped
+New env var `REFINE_TIMEOUT_SEC` (default `min(1.5 × SUBPROCESS_TIMEOUT_SEC,
+1800)`) threaded into `_execute` only on the refinement branch via optional
+`timeout` arg. Initial-draft and repair iters still use `SUBPROCESS_TIMEOUT_SEC`,
+so refinement gets headroom (TTA / larger backbones) without spending more on
+exploration. Refine prompt's EXECUTION BUDGET hint now reads `refine_timeout`.
+Exposed in `amber-manifest.json5` as `config.refine_timeout_sec`.
 
-1. **Tabular tuning.** `_self_consistency_target` now returns 2 for tabular
-   (was 4) and 2 for text (was 3). `SYSTEM_PROMPT_DIVERSITY_DIRECTIVE` rewritten:
-   pick exactly ONE axis to vary (model family), explicitly KEEP the previous
-   draft's feature pipeline, encoders, CV split, target encoding, and file
-   handling. Removed the "substantially different" framing that caused gpt-5-mini
-   to emit ambitious, brittle rewrites.
-2. **Richer static EDA in `_dataset_profile`.** New `_target_aware_eda` section
-   adds, before the planner runs, with no LLM in the loop:
-   - inferred target column (train ∖ test, last-column tiebreak)
-   - target distribution (class balance for classification, summary stats for
-     regression) and majority-class baseline
-   - top features by mutual information with the target (sklearn
-     `mutual_info_classif` / `mutual_info_regression`, on a 2000-row sample,
-     after pruning text blobs and likely-id columns)
-   - top missing-value co-occurrence patterns (which columns are missing together)
-   - compound-ID group statistics including `pct_groups_with_constant_target`
-     — directly tells the planner whether to pick GroupKFold over StratifiedKFold
-   - image class-balance from the labels CSV when applicable
-   Verified locally:
-   - spaceship-titanic: detects target=Transported, 50/50 balance, top MI =
-     CryoSleep / RoomService / Spa / VRDeck, 88% of PassengerId groups have
-     constant target → planner now has explicit signal for GroupKFold.
-   - aerial-cactus: detects target=has_cactus, 75/25 imbalance, image_label_balance
-     populated, MI correctly shows tabular features carry no signal (image lives
-     elsewhere).
-   Planner system prompt updated to point at the new EDA section.
+Live test on aerial-cactus (`eval_runs/20260503T042202Z_refine/`,
+`MAX_DEBUG_ITERS=4`, `SUBPROCESS_TIMEOUT_SEC=600`, `REFINE_TIMEOUT_SEC=900`):
 
-Pending: re-run the same sweep against these changes and compare CV /
-draft success rate vs the 2026-05-02 baseline.
+| Iter | CV | Path |
+|---|---|---|
+| 0 | 0.997475 | initial |
+| 1 | 0.998859 | refinement (+0.0014) |
+| 2 | 0.998618 | refinement |
+| 3 | 0.998842 | refinement |
 
-## 2026-05-03 — quick validation results (gpt-5-mini, 1 run each)
+Total 522s. All 4 drafts within filter epsilon → ensemble of 4. No timeouts.
 
-`eval_runs/20260503T004906Z_quick/`:
+### 2026-05-03 — ensemble filter shipped
+`MLEBenchAgent._filter_for_ensemble` (`src/agent.py`) drops drafts whose CV is
+meaningfully worse than the best draft before they reach `_ensemble`. If
+filtering leaves <2 drafts, falls through to the existing best-single path.
 
-| Competition | Iter 0 CV | Best CV | Final | Time | Notes |
-|---|---|---|---|---|---|
-| spaceship-titanic | 0.78155 | 0.790751 | ensemble of 3 (incl. cv=0.496) | 527s | **refined+ensembled; GroupKFold from EDA** |
-| aerial-cactus | **0.999383** | 0.999383 | ensemble of 2 (incl. cv=0.991) | 1279s | refined+ensembled; refine timed out @ 600s |
+Thresholds:
+- Higher-better: keep `cv >= best - max(0.005, 0.10 * (1 - best))`. At
+  best=0.999 the gap tightens to 0.005 (drops a 0.991 draft); at best=0.79
+  the gap is ~0.021 (keeps a 0.78 draft, drops a 0.50 draft).
+- Lower-better: keep `cv <= best * 1.10` (10% relative slack; tolerates
+  noise on small log-loss values).
+- `cv_score=None` drafts are dropped.
 
-**Confirmed wins:**
-1. **EDA → GroupKFold pickup** verified in the spaceship plan output: planner
-   wrote *"Use PassengerId prefix... GroupKFold; many families have constant
-   target"* — directly quoting the new `pct_groups_with_constant_target=0.876`
-   signal from `_target_aware_eda`.
-2. **Tabular refinement branch fires** for the first time (`note=refined`).
-   Tabular tuning + softer diversity directive worked at the protocol level.
-3. **Cactus initial draft cv=0.999383** — exceeds the prior leaderboard top
-   (0.99995). The richer EDA + image TTA/threshold prompt did the work before
-   refinement even ran. This is the single biggest single-iter improvement
-   we've seen.
+Motivated by 2026-05-03 quick validation
+(`eval_runs/20260503T004906Z_quick/`): spaceship had `cv=0.78/0.79` averaged
+with `cv=0.496` (near majority baseline 0.50); cactus had `cv=0.999` averaged
+with `cv=0.991`.
 
-**New dominant bug: ensemble pollution.** Both runs ended with a strong best
-draft AND a weaker draft, and the mean/majority-vote ensemble dragged the final
-output down. Spaceship: a diverse draft scored cv=0.496 (near majority baseline
-of 0.50) and got averaged with the cv=0.78 / 0.79 drafts. Cactus: the refinement
-draft after a timeout came back at cv=0.991 and got averaged with the cv=0.999
-initial. Fix is small and high-priority: filter `valid` by CV before
-`_ensemble`, dropping any draft with CV worse than `best_cv − epsilon`
-(epsilon ≈ 0.01 for accuracy/AUC, larger for log-loss; or relative to majority
-baseline).
+### 2026-05-03 — tabular tuning + richer EDA profile
+1. **Tabular tuning.** `_self_consistency_target` returns 2 for tabular (was
+   4) and 2 for text (was 3). `SYSTEM_PROMPT_DIVERSITY_DIRECTIVE` rewritten:
+   pick exactly ONE axis to vary (model family); explicitly KEEP the previous
+   draft's feature pipeline, encoders, CV split, target encoding, file
+   handling. Removed the "substantially different" framing that caused
+   gpt-5-mini to emit ambitious, brittle rewrites.
+2. **Richer static EDA in `_dataset_profile`.** New `_target_aware_eda`
+   section (no LLM in the loop), added before the planner runs:
+   - inferred target column (train ∖ test, last-column tiebreak),
+   - target distribution + majority-class baseline,
+   - top features by mutual information (sklearn
+     `mutual_info_classif`/`_regression` on a 2000-row sample, after pruning
+     text blobs and likely-id columns),
+   - top missing-value co-occurrence patterns,
+   - compound-ID group statistics including
+     `pct_groups_with_constant_target` (directly tells the planner whether
+     to pick GroupKFold over StratifiedKFold),
+   - image class-balance from the labels CSV when applicable.
 
-**Cactus refinement timeout.** Iter 1 refinement hit the 600s subprocess cap.
-Either raise per-iter image timeout when refining (refinements can add TTA /
-larger backbones), or tighten the refinement prompt to enforce a hard "stay
-inside the budget" requirement for image. Cheaper path: raise the image
-per-iter cap to 900s in the AgentBeats config block.
+Quick validation (`eval_runs/20260503T004906Z_quick/`): spaceship planner
+quoted `pct_groups_with_constant_target=0.876` and picked GroupKFold; cactus
+iter 0 hit cv=0.999383 (single-iter score above prior leaderboard top
+0.99995).
 
-**Next concrete fixes (ordered):**
-1. Filter weak drafts in `_ensemble` (drop CV-worse-than-best-by-epsilon).
-2. Bump image refinement budget (config-level, not code).
-3. Re-run quick validation to verify ensemble lift cleans up.
+### 2026-05-02 — refinement loop added
+After `target_n` diverse drafts succeed, remaining iters call `_refine_code`
+on the current best valid draft. Refined drafts join `valid` and participate
+in the ensemble. Image runs benefit most since `target_n=1` for image — every
+iter after the first is a refinement pass.
+
+### 2026-05-01 — initial submitted results
+Submitted via Quick Submit on agentbeats.dev:
+
+| Competition | Rank | Score | Total duration |
+|---|---:|---:|---:|
+| spaceship-titanic | 50th | 0.81839 | 6m 31s |
+| aerial-cactus-identification | 8th | 0.99592 | 10m 41s |
+| dogs-vs-cats-redux-kernels-edition | **1st** | 0.03321 | 29m 9s |
+| icml-2013-whale-challenge | — | — | green-side error |
+
+Dogs-vs-cats placed 1st on an empty sub-leaderboard, ran right against the
+30-min Quick Submit cap.
