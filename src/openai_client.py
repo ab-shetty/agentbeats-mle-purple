@@ -1,6 +1,6 @@
 """Thin OpenAI Responses-API wrapper used by the agent loop.
 
-Uses OPENAI_API_KEY plus the model from OPENAI_MODEL (default `gpt-5-mini`).
+Uses OPENAI_API_KEY plus the model from OPENAI_MODEL (default `gpt-5.4`).
 Exposes a `complete(system, user, ...)` helper that returns plain text.
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ def complete(
 ) -> str:
     """Call the Responses API and return the concatenated text output."""
     client = _client_singleton()
-    model = model or os.environ.get("OPENAI_MODEL", "gpt-5-mini")
+    model = model or os.environ.get("OPENAI_MODEL", "gpt-5.4")
     effort = reasoning_effort or os.environ.get("REASONING_EFFORT", "medium")
 
     kwargs: dict[str, Any] = {

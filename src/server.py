@@ -21,8 +21,8 @@ def build_app(*, host: str, port: int, card_url: str | None = None) -> Starlette
         name="MLE-Bench Kaggle competition solver",
         description=(
             "Receives a Kaggle-style competition tarball, drafts a solution.py "
-            "with gpt-5-mini in an iterative plan/code/run/debug loop, and "
-            "returns submission.csv as a task artifact."
+            "with the configured OpenAI model in an iterative plan/code/run/"
+            "debug loop, and returns submission.csv as a task artifact."
         ),
         tags=["mle-bench", "kaggle", "ml-engineering", "code-agent"],
         examples=[
@@ -31,7 +31,7 @@ def build_app(*, host: str, port: int, card_url: str | None = None) -> Starlette
     )
 
     agent_card = AgentCard(
-        name="MLE-Bench Purple Agent (gpt-5-mini)",
+        name=f"MLE-Bench Purple Agent ({os.environ.get('OPENAI_MODEL', 'gpt-5.4')})",
         description=(
             "AIDE-style ML engineering agent for MLE-Bench. Plans, writes, "
             "executes, and debugs a solution.py against the provided dataset, "
@@ -61,7 +61,7 @@ def build_app(*, host: str, port: int, card_url: str | None = None) -> Starlette
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="MLE-Bench Purple Agent (gpt-5-mini, AIDE-style)")
+    parser = argparse.ArgumentParser(description="MLE-Bench Purple Agent (AIDE-style)")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--card-url", default=None)

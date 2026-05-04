@@ -1006,11 +1006,21 @@ class MLEBenchAgent:
 
     @staticmethod
     def _extract_code(text: str) -> str:
+        # Try the strict ```python fence first.
         m = re.search(r"```python\s*\n(.*?)```", text, re.DOTALL)
         if m:
             return m.group(1)
-        # If model forgot the fence, return as-is.
-        return text
+        # Fall back to any ``` fence with python-looking content
+        # (covers the model occasionally emitting just ``` instead of ```python).
+        m = re.search(r"```\s*\n(.*?)```", text, re.DOTALL)
+        if m:
+            inner = m.group(1)
+            if re.search(r"\b(import|def|class|from)\b", inner):
+                return inner
+        # No code block found. Return empty so callers can detect and
+        # treat this as a failed iter (route to repair) instead of writing
+        # raw markdown/prose to a .py file.
+        return ""
 
     # ------------------------------------------------------------------ steps
 
@@ -1232,6 +1242,31 @@ class MLEBenchAgent:
         return "execution_bug"
 
     def _execute(self, code: str, iter_idx: int, timeout: int | None = None) -> StepResult:
+        # Reject empty / whitespace-only code up front. Writing an empty
+        # solution_*.py and running it returns rc=0 without producing a
+        # submission and looks identical in logs to a fast-but-broken script,
+        # which is exactly the silent-failure mode we want to surface.
+        if not code or not code.strip():
+            logger.warning(
+                "Iter %d: empty code from generator (no ```python``` block "
+                "extracted). Treating as execution_bug so the next iter can "
+                "repair instead of running an empty script.",
+                iter_idx,
+            )
+            return StepResult(
+                code=code,
+                stdout="",
+                stderr=(
+                    "Generator returned no parseable Python code block. "
+                    "The previous LLM call likely emitted prose / no fenced "
+                    "code. Re-emit a complete solution.py wrapped in "
+                    "```python ... ``` fences."
+                ),
+                returncode=-4,
+                submission_ok=False,
+                submission_error="empty script (no code block extracted)",
+                cv_score=None,
+            )
         script_path = self.solutions_dir / f"solution_{iter_idx}.py"
         script_path.write_text(code)
         output_path = self.submissions_dir / f"submission_{iter_idx}.csv"
