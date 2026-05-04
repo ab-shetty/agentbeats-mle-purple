@@ -145,7 +145,6 @@ src/
   openai_client.py   OpenAI Responses API wrapper (reasoning models)
 scripts/
   local_test.py      Mocked-green driver for local dry-runs
-  planner_ping.py    Standalone smoke test for the planner JSON contract
 Dockerfile           CPU-only image: torch CPU + sklearn / lightgbm / xgboost /
                      catboost / timm / transformers + opencv-headless
 amber-manifest.json5 AgentBeats deployment manifest (image, env, config schema)
