@@ -175,7 +175,7 @@ can be reused across competitions with per-task overrides:
 | Key | Default | Purpose |
 |---|---|---|
 | `openai_api_key` | required | OpenAI credential (secret) |
-| `openai_model` | `gpt-5-mini` | Planner / coder / refiner model |
+| `openai_model` | `gpt-5.4` | Planner / coder / refiner model |
 | `reasoning_effort` | `medium` | `low` / `medium` / `high` |
 | `max_debug_iters` | `5` | Plan / code / run cycles per draft |
 | `total_budget_sec` | `14400` (4h) | Hard cap across the full run; matches the empirical Quick-Submit cap |
