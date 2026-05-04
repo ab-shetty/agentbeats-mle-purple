@@ -12,7 +12,7 @@ no GPU** — and handles tabular, text, and image competitions from a single bin
 ## How it works
 
 The agent implements an **AIDE-style plan / code / execute / debug loop** driven by
-an OpenAI reasoning model (`gpt-5-mini` by default; configurable per submission):
+an OpenAI reasoning model (configurable per submission):
 
 ```
    ┌──────────────────────────────────────────────────────────────┐
