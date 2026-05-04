@@ -6,8 +6,6 @@ data, sample submission), the agent plans a solution, writes code, runs it, debu
 failures, optionally refines or ensembles, and returns a `submission.csv` that the
 benchmark grades against the held-out leaderboard.
 
-The agent runs entirely on the AgentBeats Quick-Submit runner — **4 vCPU, 16 GB RAM,
-no GPU** — and handles tabular, text, and image competitions from a single binary.
 
 ## How it works
 
