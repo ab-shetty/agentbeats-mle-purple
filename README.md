@@ -37,19 +37,28 @@ an OpenAI reasoning model (configurable per submission):
                                  │
                                  ▼
    ┌──────────────────────────────────────────────────────────────┐
-   │  Execute  (sandboxed subprocess, per-iter wall-clock budget) │
+   │  Self-review  (LLM pass, gated by SELF_REVIEW)               │
+   │  10 known bug categories → NO_ISSUES or repaired script      │
+   └──────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+   ┌──────────────────────────────────────────────────────────────┐
+   │  Execute  (sandboxed subprocess, dynamic wall-clock budget)  │
    │  capture stdout/stderr, validate submission against schema   │
    └──────────────────────────────────────────────────────────────┘
                                  │
-                  pass ──────────┴────────── fail / invalid CSV
+                  ok ────────────┴──────────── execution_bug / schema_bug
                     │                                │
                     ▼                                ▼
           ┌──────────────────┐            ┌──────────────────────┐
-          │ Optional Refine  │            │ Debug: feed error    │
-          │ (Optuna · stack ·│            │ back, regenerate the │
-          │  feature eng. ·  │            │ script, try again    │
+          │ Optional Refine  │            │ Repair (min-diff):   │
+          │ (Optuna · stack ·│            │ patch failing lines, │
+          │  feature eng. ·  │            │ keep model & pipeline│
           │  TTA · larger    │            │ (≤ MAX_DEBUG_ITERS)  │
-          │  backbone)       │            └──────────────────────┘
+          │  backbone) OR    │            └──────────────────────┘
+          │ next draft with  │
+          │ rotated model    │
+          │ family           │
           └──────────────────┘
                     │
                     ▼
@@ -62,7 +71,13 @@ an OpenAI reasoning model (configurable per submission):
           └──────────────────┘
                     │
                     ▼
-              submission.csv
+   ┌──────────────────────────────────────────────────────────────┐
+   │  Pick winner: ensemble → best-CV single draft →              │
+   │  sample_submission.csv fallback (always ship a valid CSV)    │
+   └──────────────────────────────────────────────────────────────┘
+                                 │
+                                 ▼
+                          submission.csv
 ```
 
 ### Key design choices
@@ -82,14 +97,34 @@ an OpenAI reasoning model (configurable per submission):
   mutual information vs. target, group-ID detection, target homogeneity per
   group) is included in the planner prompt so the LLM picks GroupKFold when it
   matters and prioritizes feature engineering on high-MI columns.
-- **Hard wall-clock budget.** Every `solution.py` runs under a per-iteration
-  subprocess timeout. The coder prompt enforces a "≤ 80% of budget" rule and
-  instructs the LLM to pick a leaner version of the same approach rather than
-  hope a slow CPU finishes in time. A finished mediocre submission beats a
-  timed-out one.
-- **Real debug, not paper-overs.** When a script crashes or produces an invalid
-  submission, the full traceback / schema error is fed back to the coder with an
-  explicit instruction to fix the root cause — no `try/except` swallowing.
+- **Dynamic wall-clock budget.** The agent tracks a single total wall-clock
+  budget (default 4h, matching the Quick-Submit cap) and derives each iter's
+  timeout from the remaining budget — the first draft can spend most of the
+  budget if needed, later iters get whatever's left, and a fixed reserve at
+  the end is held back for ensembling, schema validation, and CSV write. The
+  coder prompt enforces a "≤ 80% of budget" rule so a slow CPU doesn't push
+  an iter over; a finished mediocre submission beats a timed-out one.
+- **Pre-execution self-review.** Between code-gen and subprocess execution, a
+  separate LLM pass reviews the script for ten known bug categories (CatBoost
+  NaN in `cat_features`, LightGBM 4.x API misuse, missing
+  `enable_categorical=True`, CV leakage from non-OOF target encodings,
+  submission schema mismatch, bool-vs-string label confusion, image dataloader
+  `None` collate, hard-coded paths, missing `CV score:` print, writing to the
+  wrong path) and emits either `NO_ISSUES` or a repaired script. A subprocess
+  timeout costs 15–30 min, so this LLM call is cheap insurance.
+- **Repair vs. redraft branching.** After each iter the loop classifies the
+  result (`execution_bug` / `schema_bug` / `ok`) and dispatches to a different
+  prompt: a **minimum-diff repair** prompt patches the precise failing line(s)
+  while keeping the model family and feature pipeline intact, vs. a fresh
+  **draft** prompt only when starting over. No `try/except` band-aids — repairs
+  must address the root cause.
+- **Best-of-N with safe fallback.** When the ensemble is disabled or the
+  averaged submission fails schema validation, the agent picks the best
+  individual valid draft by CV score (respecting the metric's
+  lower-is-better/higher-is-better direction inferred by the planner). If no
+  draft produced a valid submission at all, the agent ships a copy of
+  `sample_submission.csv` so the grader always receives a well-formed CSV
+  rather than a hard failure.
 - **Self-consistency ensemble (optional).** When the planner requests multiple
   drafts, each subsequent draft is told to *swap the model family* (rotation:
   LightGBM → CatBoost → XGBoost; LogReg → LinearSVC → SGD; resnet18 →
@@ -109,14 +144,12 @@ src/
   agent.py           Plan / code / execute / debug / refine / ensemble loop
   openai_client.py   OpenAI Responses API wrapper (reasoning models)
 scripts/
-  local_test.py                Mocked-green driver for local dry-runs
-  fetch_spaceship_titanic.sh   Pull a sample Kaggle dataset
-  fetch_dogs_vs_cats.sh
+  local_test.py      Mocked-green driver for local dry-runs
+  planner_ping.py    Standalone smoke test for the planner JSON contract
 Dockerfile           CPU-only image: torch CPU + sklearn / lightgbm / xgboost /
                      catboost / timm / transformers + opencv-headless
 amber-manifest.json5 AgentBeats deployment manifest (image, env, config schema)
 requirements.txt
-roadmap.md           Internal handoff doc (per-competition status & tunings)
 ```
 
 ## A2A protocol
@@ -136,8 +169,8 @@ The agent speaks the AgentBeats A2A protocol over HTTP on port 8080.
 
 ## Configuration
 
-The manifest exposes everything as Quick-Submit config so the same image can be
-reused across competitions with per-task overrides:
+The manifest exposes the primary knobs as Quick-Submit config so the same image
+can be reused across competitions with per-task overrides:
 
 | Key | Default | Purpose |
 |---|---|---|
@@ -145,19 +178,33 @@ reused across competitions with per-task overrides:
 | `openai_model` | `gpt-5-mini` | Planner / coder / refiner model |
 | `reasoning_effort` | `medium` | `low` / `medium` / `high` |
 | `max_debug_iters` | `5` | Plan / code / run cycles per draft |
-| `subprocess_timeout_sec` | `1500` | Per-iter `solution.py` wall clock |
-| `refine_timeout_sec` | — | Override for the refinement pass |
-| `total_budget_sec` | — | Hard cap across the full run |
+| `total_budget_sec` | `14400` (4h) | Hard cap across the full run; matches the empirical Quick-Submit cap |
+| `subprocess_timeout_sec` | = `total_budget_sec` | Upper bound on a single `solution.py` iter; per-iter timeouts are derived dynamically from remaining budget |
+| `refine_timeout_sec` | `1.5 × subprocess_timeout_sec` | Upper bound on the refinement pass |
+
+Additional env-var knobs read by the agent (not in the manifest schema; set via
+the container env if you need to override):
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `FINALIZE_RESERVE_SEC` | `120` | End-of-run reserve held back for ensembling, schema validation, CSV write |
+| `SELF_REVIEW` | `1` | Pre-execution LLM self-review pass between code-gen and subprocess; set to `0` to disable |
+| `SELF_CONSISTENCY_N` | planner-decided | Force a specific number of self-consistency drafts, overriding the planner's `iteration_strategy.n_drafts` |
+| `OPENAI_RETRY_ATTEMPTS` | `4` | Retries on transient OpenAI errors (429 / 5xx / connection) |
+| `OPENAI_RETRY_BASE_SEC` | `2.0` | Initial backoff delay; exponential with jitter |
+| `OPENAI_RETRY_MAX_SEC` | `20.0` | Cap on backoff delay |
+| `WORKSPACE_DIR` | `/tmp/purple_workspace` | Where the executor extracts the competition tarball |
 
 ## Local development
 
 ```bash
 python3.13 -m pip install -r requirements.txt
-./scripts/fetch_spaceship_titanic.sh ./data/spaceship-titanic
+# Drop a Kaggle competition's files into ./data/<competition>/
+# (description.md, train.csv, test.csv, sample_submission.csv, ...)
 export OPENAI_API_KEY=sk-...
 python -m src.server --host 127.0.0.1 --port 8080
 # In another shell:
-python scripts/local_test.py --data-dir ./data/spaceship-titanic
+python scripts/local_test.py --data-dir ./data/<competition>
 ```
 
 `local_test.py` plays the role of the green grader: it tarballs the dataset,
