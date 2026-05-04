@@ -468,6 +468,8 @@ class MLEBenchAgent:
         self.data_listing = self._list_data_dir(data_dir)
         self.dataset_profile = self._dataset_profile()
         self.is_lower_better: bool | None = None
+        self.eval_metric: str | None = None
+        self.task_type: str | None = None
 
     # ------------------------------------------------------------------ utils
 
@@ -898,6 +900,94 @@ class MLEBenchAgent:
             "no": False,
         }
         return mapping.get(token)
+
+    @staticmethod
+    def _normalize_metric_name(metric: str | None) -> str | None:
+        if not metric:
+            return None
+        normalized = re.sub(r"[^a-z0-9]+", "", metric.lower())
+        return normalized or None
+
+    @classmethod
+    def _metric_is_lower_better(cls, metric: str | None) -> bool | None:
+        token = cls._normalize_metric_name(metric)
+        if not token:
+            return None
+
+        lower_better_markers = (
+            "logloss",
+            "crossentropy",
+            "rmse",
+            "rmsle",
+            "mae",
+            "mse",
+            "msle",
+            "poisson",
+            "tweedie",
+            "gamma",
+            "huber",
+            "quantile",
+            "pinball",
+            "mape",
+            "smape",
+            "error",
+            "loss",
+        )
+        higher_better_markers = (
+            "accuracy",
+            "auc",
+            "averageprecision",
+            "prauc",
+            "map",
+            "ndcg",
+            "f1",
+            "fbeta",
+            "precision",
+            "recall",
+            "iou",
+            "jaccard",
+            "dice",
+            "mcc",
+            "kappa",
+            "r2",
+            "gini",
+        )
+
+        if any(marker in token for marker in lower_better_markers):
+            return True
+        if any(marker in token for marker in higher_better_markers):
+            return False
+        return None
+
+    @classmethod
+    def _metric_prefers_probabilities(cls, metric: str | None) -> bool:
+        token = cls._normalize_metric_name(metric)
+        if not token:
+            return False
+        probability_markers = (
+            "logloss",
+            "crossentropy",
+            "auc",
+            "averageprecision",
+            "prauc",
+            "brier",
+        )
+        return any(marker in token for marker in probability_markers)
+
+    @staticmethod
+    def _series_is_integer_like(series: object) -> bool:
+        try:
+            import pandas as pd
+
+            numeric = pd.to_numeric(series, errors="coerce")
+            values = numeric.to_numpy(dtype=float, na_value=np.nan)
+        except Exception:
+            return False
+
+        values = values[np.isfinite(values)]
+        if values.size == 0:
+            return False
+        return bool(np.allclose(values, np.round(values), atol=1e-9, rtol=0.0))
 
     @staticmethod
     def _compound_value_hint(values: list[object]) -> dict[str, object] | None:
@@ -1339,13 +1429,18 @@ class MLEBenchAgent:
 
     @staticmethod
     def _extract_cv(stdout: str) -> float | None:
-        m = re.search(r"CV score:\s*([-+]?\d*\.?\d+)", stdout)
-        if not m:
+        matches = re.findall(
+            r"CV score:\s*([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)",
+            stdout,
+            flags=re.IGNORECASE,
+        )
+        if not matches:
             return None
         try:
-            return float(m.group(1))
+            value = float(matches[-1])
         except Exception:
             return None
+        return value if np.isfinite(value) else None
 
     # -------------------------------------------------------------------- run
 
@@ -1365,6 +1460,8 @@ class MLEBenchAgent:
     def run(self) -> Path:
         self._run_start = time.monotonic()
         plan = self._make_plan()
+        self.eval_metric = self._plan_eval_metric(plan)
+        self.task_type = self._plan_task_type(plan)
         self.is_lower_better = self._plan_is_lower_better(plan)
         target_n = self._self_consistency_target(plan)
         strategy = self._iteration_strategy(plan)
@@ -1412,9 +1509,7 @@ class MLEBenchAgent:
             elif category == "ok" and len(valid) >= target_n and do_refine:
                 # Exploration target reached — exploit remaining iters by refining
                 # the current best valid draft.
-                best_result, _ = valid[
-                    max(range(len(valid)), key=lambda j: self._cv_score_for_sort(valid[j][0]))
-                ]
+                best_result, _ = valid[self._best_valid_index(valid)]
                 logger.info(
                     "Refinement pass: improving best draft (cv=%s)",
                     best_result.cv_score,
@@ -1459,10 +1554,7 @@ class MLEBenchAgent:
                 )
 
         if valid:
-            best_idx = max(
-                range(len(valid)),
-                key=lambda j: self._cv_score_for_sort(valid[j][0]),
-            )
+            best_idx = self._best_valid_index(valid)
             best_result, best_path = valid[best_idx]
             logger.info(
                 "Using best single draft (idx=%d, cv=%s)",
@@ -1521,9 +1613,50 @@ class MLEBenchAgent:
     def _cv_score_for_sort(self, r: StepResult) -> float:
         if r.cv_score is None:
             return float("-inf")
-        # If direction is unknown, default to higher-better but log a warning
-        # once at filter/sort time (filter handles its own warning).
         return -r.cv_score if self.is_lower_better is True else r.cv_score
+
+    def _best_valid_index(self, valid: list[tuple[StepResult, Path]]) -> int:
+        if not valid:
+            raise ValueError("valid drafts list is empty")
+        if self.is_lower_better is None:
+            logger.warning(
+                "Best-draft selection: metric direction is unknown; using the most recent valid draft.",
+            )
+            return len(valid) - 1
+
+        scored = [i for i, (result, _) in enumerate(valid) if result.cv_score is not None]
+        if not scored:
+            return len(valid) - 1
+        return max(scored, key=lambda i: self._cv_score_for_sort(valid[i][0]))
+
+    def _should_average_numeric_predictions(
+        self,
+        cols: list[object],
+        *,
+        pred_col_count: int,
+    ) -> bool:
+        if self.task_type == "regression":
+            return True
+        if self._metric_prefers_probabilities(self.eval_metric):
+            return True
+        if not all(self._series_is_integer_like(series) for series in cols):
+            return True
+        if self.task_type in {
+            "binary_classification",
+            "multiclass_classification",
+            "multilabel_classification",
+        }:
+            return False
+
+        try:
+            import pandas as pd
+
+            combined = pd.concat(cols, axis=0, ignore_index=True).dropna()
+            unique_count = int(combined.nunique()) if not combined.empty else 0
+        except Exception:
+            unique_count = 0
+        threshold = 128 if pred_col_count == 1 else 8
+        return not (0 < unique_count <= threshold)
 
     def _filter_for_ensemble(
         self, valid: list[tuple[StepResult, Path]],
@@ -1556,7 +1689,7 @@ class MLEBenchAgent:
                 "Ensemble filter: is_lower_better is unknown; cannot rank "
                 "drafts. Returning only the last valid draft.",
             )
-            return [scored[-1]]
+            return [valid[-1]]
 
         best_cv = max(self._cv_score_for_sort(r) for r, _ in scored)
         # Convert sort-space epsilon back into raw-metric comparisons.
@@ -1584,9 +1717,10 @@ class MLEBenchAgent:
     def _ensemble(self, valid: list[tuple[StepResult, Path]]) -> Path | None:
         """Combine N valid submissions into one.
 
-        Numeric prediction columns are averaged; non-numeric (string / bool)
-        columns are majority-voted. ID column / row order is taken from
-        sample_submission.csv when available, else from the first draft.
+        Probability / regression outputs are averaged. Hard-label outputs
+        (including integer class IDs) are majority-voted. ID column / row
+        order is taken from sample_submission.csv when available, else from
+        the first draft.
         """
         try:
             import pandas as pd
@@ -1636,44 +1770,27 @@ class MLEBenchAgent:
                 logger.warning("Ensemble concat error on %s: %s", col, e)
                 return None
 
-            sample_bool_like = self._is_bool_like(sample[col].dropna())
-            if sample_bool_like:
-                normalized_cols = []
-                for series in cols:
-                    normalized = series.apply(self._normalize_bool_token)
-                    if normalized.notna().all():
-                        normalized_cols.append(normalized.astype(float))
-                    elif pd.api.types.is_numeric_dtype(series):
-                        normalized_cols.append(series.astype(float))
-                    else:
-                        logger.warning(
-                            "Ensemble bool column %s has non-bool-like values", col,
-                        )
-                        return None
-                out[col] = pd.concat(normalized_cols, axis=1).mean(axis=1) >= 0.5
-                continue
-
-            # Decide aggregation: numeric → mean; otherwise majority vote.
             numeric_cols = [pd.api.types.is_numeric_dtype(s) for s in cols]
             if all(numeric_cols):
-                out[col] = stacked.mean(axis=1)
+                if self._should_average_numeric_predictions(
+                    cols, pred_col_count=len(pred_cols),
+                ):
+                    out[col] = stacked.mean(axis=1)
+                else:
+                    rounded = [pd.to_numeric(series, errors="coerce").round().astype("Int64") for series in cols]
+                    voted = pd.concat(rounded, axis=1).mode(axis=1, dropna=True)
+                    if voted.empty:
+                        logger.warning("Ensemble vote produced no values for %s", col)
+                        return None
+                    out[col] = voted.iloc[:, 0].astype(int)
             else:
                 # Majority vote on stringified values (handles bool/str uniformly).
                 stacked_str = stacked.astype(str)
-                voted = stacked_str.mode(axis=1).iloc[:, 0]
-                # Coerce booleans back when the original samples were boolean-ish.
-                bool_like = {"True", "False", "true", "false", "0", "1"}
-                if set(map(str, voted.unique())).issubset(bool_like):
-                    sample_dtype = sample[col].dtype
-                    if sample_dtype == bool or sample[col].astype(str).isin(
-                        {"True", "False"}
-                    ).all():
-                        out[col] = voted.map(
-                            {"True": True, "true": True, "1": True,
-                             "False": False, "false": False, "0": False}
-                        )
-                        continue
-                out[col] = voted
+                voted = stacked_str.mode(axis=1, dropna=True)
+                if voted.empty:
+                    logger.warning("Ensemble vote produced no values for %s", col)
+                    return None
+                out[col] = voted.iloc[:, 0]
 
         out = out.reset_index()
         ens_path = self.submissions_dir / "submission_ensemble.csv"
@@ -1685,10 +1802,33 @@ class MLEBenchAgent:
         return ens_path
 
     @staticmethod
-    def _plan_is_lower_better(plan: str) -> bool | None:
+    def _plan_json(plan: str) -> dict[str, object]:
         try:
             parsed = json.loads(plan)
         except Exception:
-            return None
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
+    @classmethod
+    def _plan_eval_metric(cls, plan: str) -> str | None:
+        metric = cls._plan_json(plan).get("eval_metric")
+        return metric if isinstance(metric, str) else None
+
+    @classmethod
+    def _plan_task_type(cls, plan: str) -> str | None:
+        task_type = cls._plan_json(plan).get("task_type")
+        return task_type if isinstance(task_type, str) else None
+
+    @classmethod
+    def _plan_is_lower_better(cls, plan: str) -> bool | None:
+        parsed = cls._plan_json(plan)
         value = parsed.get("is_lower_better")
-        return value if isinstance(value, bool) else None
+        if isinstance(value, bool):
+            return value
+        inferred = cls._metric_is_lower_better(parsed.get("eval_metric"))
+        if inferred is not None:
+            logger.warning(
+                "Planner omitted is_lower_better; inferred direction from eval_metric=%r.",
+                parsed.get("eval_metric"),
+            )
+        return inferred
