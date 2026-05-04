@@ -22,6 +22,7 @@
       MAX_DEBUG_ITERS: { when: "config.max_debug_iters", value: "${config.max_debug_iters}" },
       SUBPROCESS_TIMEOUT_SEC: { when: "config.subprocess_timeout_sec", value: "${config.subprocess_timeout_sec}" },
       REFINE_TIMEOUT_SEC:     { when: "config.refine_timeout_sec",     value: "${config.refine_timeout_sec}" },
+      TOTAL_BUDGET_SEC:       { when: "config.total_budget_sec",       value: "${config.total_budget_sec}" },
       LOG_LEVEL: "INFO",
     },
     network: {
@@ -39,6 +40,7 @@
       max_debug_iters:        { type: "string" },
       subprocess_timeout_sec: { type: "string" },
       refine_timeout_sec:     { type: "string" },
+      total_budget_sec:       { type: "string" },
     },
     required: ["openai_api_key"],
     additionalProperties: false,

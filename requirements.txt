@@ -10,6 +10,8 @@ numpy>=1.26.0
 scikit-learn>=1.4.0
 lightgbm>=4.3.0
 xgboost>=2.0.0
+catboost>=1.2.0
+optuna>=3.5.0
 # CV / NLP stack (CPU-only torch installed separately in Dockerfile from
 # pytorch CPU wheel index to keep the image small).
 timm>=1.0.0

@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -67,6 +68,31 @@ Output a JSON object (and ONLY a JSON object, no prose) with these keys:
                     classical / hand-crafted baseline just because it is safe;
                     if a properly-trained model fits the budget and is
                     expected to score better, that one is `model_plan[0]`.
+  iteration_strategy: object describing how the loop should spend iterations.
+                    Schema:
+                      {
+                        "n_drafts":   1|2|3,
+                        "do_refine":  true|false,
+                        "do_ensemble":true|false,
+                        "rationale":  short string
+                      }
+                    Decide based on confidence in `model_plan[0]`:
+                      • n_drafts=1, do_refine=false, do_ensemble=false when
+                        `model_plan[0]` is a strong well-known recipe that
+                        usually scores near the top on the FIRST try (e.g. a
+                        canonical TF-IDF + per-label OvR LogReg for sparse
+                        multi-label text; a single tuned GBM on a clean
+                        tabular task with strong signal).
+                      • n_drafts=2, do_refine=true, do_ensemble=true when
+                        `model_plan[0]` is solid but a different model family
+                        (`model_plan[1]`) plausibly catches a different signal
+                        and a meta-blend would help.
+                      • n_drafts=3, do_refine=true, do_ensemble=true only when
+                        the task is genuinely ambiguous (noisy small data,
+                        unfamiliar metric, multiple plausible reframings) and
+                        diverse drafts truly explore different hypotheses.
+                    Spending more iterations than necessary is wasteful and
+                    increases the chance of crashing late in the budget.
 
 Be concise. Be correct about column names, metric direction, modality, and
 the actual observed file layout. If image roots are nested, use the detected
@@ -88,6 +114,15 @@ GENERAL CONSTRAINTS:
   - Wrap the script in `if __name__ == "__main__": main()` style.
   - Execution is CPU-only. Respect the provided subprocess timeout budget.
     Plan training to finish well inside that budget and leave time for inference + writing the CSV.
+  - **Hard budget rule**: your code's total runtime (load + train + CV +
+    inference + write) MUST NOT exceed `EXECUTION BUDGET (seconds)` shown in
+    the user message. Aim for ≤ 80% of that budget so a slow CPU does not
+    push you over. If `model_plan[0]`'s wall-clock estimate is larger than
+    `EXECUTION BUDGET`, do NOT just run it and hope — pick a leaner version
+    of the SAME approach (smaller model, fewer folds/epochs, smaller patch
+    grid for vision, smaller char-ngram range for text, fewer Optuna trials,
+    sub-sampled training rows for the very largest fold-fits). Document the
+    trim with a one-line print at the top of `main()`.
   - If the previous attempt produced an error or invalid submission, fix the root cause —
     do not just paper over with try/except.
   - Implement `model_plan[0]` from the planner's JSON. The planner has ranked
@@ -97,7 +132,7 @@ GENERAL CONSTRAINTS:
     Python with the available libraries within the budget.
 
 AVAILABLE LIBRARIES:
-  - Always: pandas, numpy, scikit-learn, lightgbm, xgboost, scipy.
+  - Always: pandas, numpy, scikit-learn, lightgbm, xgboost, catboost, scipy, optuna.
   - Image / CV: torch (CPU), torchvision, timm, PIL, cv2 (opencv-python-headless).
   - Text / NLP: transformers, scikit-learn TfidfVectorizer.
 
@@ -113,16 +148,33 @@ TABULAR:
   - LightGBM 4.x API: do NOT pass `early_stopping_rounds` or `verbose` as fit() kwargs.
     Use callbacks: `clf.fit(X_tr, y_tr, eval_set=[(X_va, y_va)],
     callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)])`.
-  - If the target column is boolean / bool-like, encode it with `astype(int)` or
-    `{True: 1, False: 0}`. Do NOT map only string keys like `{"True": 1, "False": 0}`
-    unless the dataset profile shows the training labels are actually strings.
-  - For categoricals, prefer pandas `category` dtype + native LightGBM handling
-    (`categorical_feature='auto'`) over one-hot.
+  - CatBoost is a strong alternative tabular model. Critical footgun:
+    `cat_features` columns must NOT contain NaN — convert with
+    `df[c] = df[c].astype(str).fillna('missing')` (or use `.where(notna,'missing')`)
+    BEFORE fitting. CatBoost also does not need one-hot — pass raw strings via
+    `cat_features=[...]`. Use `iterations=2000, early_stopping_rounds=100,
+    verbose=0`.
+  - XGBoost ≥2.0 supports native categoricals via `enable_categorical=True` with
+    pandas `category` dtype.
   - If you derive group-level features from IDs, never leak labels across folds:
     target-conditional aggregates must be computed out-of-fold, and any family /
     passenger / session group should stay intact within a fold.
+  - If the target column is boolean / bool-like, encode it with `astype(int)` or
+    `{True: 1, False: 0}`. Do NOT map only string keys like `{"True": 1, "False": 0}`
+    unless the dataset profile shows the training labels are actually strings.
+  - For categoricals (LightGBM), prefer pandas `category` dtype + native handling
+    (`categorical_feature='auto'`) over one-hot.
   - Engineer features specific to the dataset (parse compound IDs, group keys,
     aggregate stats, etc.) before falling back to generic encoders.
+  - **Always save out-of-fold (OOF) predictions** for downstream stacking. If
+    `os.environ.get('OOF_PATH')` is set, write a CSV to that path with one row
+    per train sample (in the original train.csv order) and one column per
+    prediction column from sample_submission.csv (excluding the id column).
+    For multi-class softmax, save the probability of each class. The harness
+    uses these to fit a meta-learner across multiple drafts.
+  - Optuna is available for hyperparameter tuning when the budget allows
+    (typically inside a refinement pass, not the initial draft). Cap trials so
+    the total tuning time is ≤ 30% of the execution budget.
 
 TEXT (e.g. jigsaw-toxic-comment-classification):
   - Strong CPU baseline: TF-IDF (word 1-2grams + char 3-5grams, sublinear_tf) +
@@ -178,16 +230,29 @@ This draft is part of a self-consistency ensemble — the goal is COMPLEMENTARY 
 through a different model family, while KEEPING the data preparation that already
 worked. The previous successful drafts in this run are summarized below.
 
-WHAT TO CHANGE (pick exactly ONE primary axis):
-  - Model family: switch from LightGBM ↔ XGBoost ↔ sklearn HistGradientBoosting
-    (tabular); TF-IDF+LogReg ↔ TF-IDF+LinearSVC (text); timm backbone ↔ another
-    similarly-sized timm backbone (image). Pick a model the standard CPU stack
-    handles cleanly — do NOT introduce libraries the previous draft did not use.
+WHAT TO CHANGE — switch the model family to one you have NOT used yet in this run.
+Use this rotation order (skip ones already tried):
+  Tabular: LightGBM → CatBoost → XGBoost → sklearn HistGradientBoostingClassifier/Regressor.
+  Text:    TF-IDF+LogisticRegression → TF-IDF+LinearSVC (with `CalibratedClassifierCV`
+           if the schema needs probabilities) → TF-IDF+SGDClassifier(loss='log_loss').
+  Image:   current timm backbone → a DIFFERENT same-size timm backbone
+           (e.g. resnet18 → efficientnet_b0; convnext_tiny → resnet34).
+
+CRITICAL — read the previous draft's imports carefully. If a previous draft already
+used CatBoost, do NOT pick CatBoost again — pick the next unused family in the rotation.
+
+If you pick CatBoost, remember the cat_features NaN footgun:
+  cat_cols = [...]
+  for c in cat_cols:
+      train[c] = train[c].astype(str).where(train[c].notna(), 'missing')
+      test[c]  = test[c].astype(str).where(test[c].notna(),  'missing')
+  CatBoostClassifier(iterations=2000, early_stopping_rounds=100, verbose=0,
+                     cat_features=cat_cols)
 
 WHAT TO KEEP (do NOT change unless the previous draft has a clear bug there):
   - The exact feature pipeline / tokenization / image preprocessing that produced
-    the previous successful draft's CV. Reuse the same encoders, same feature names,
-    same handling of missing values.
+    the previous successful draft's CV. Reuse the same engineered columns, same
+    encoders, same handling of missing values.
   - The CV split strategy (stratified vs group-k-fold) and the fold count.
   - The target encoding (boolean → int, label mapping, etc.).
   - File / path handling that already works.
@@ -198,7 +263,8 @@ the model is too risky — it usually crashes and contributes nothing.
 
 Predictions will be averaged across drafts, so output WELL-CALIBRATED probabilities
 when the submission accepts floats; if the schema demands hard labels, output
-those (we'll majority-vote).
+those (we'll majority-vote). Also save OOF predictions to `os.environ['OOF_PATH']`
+if set, so the harness can stack with a meta-learner.
 
 """
 
@@ -221,28 +287,98 @@ CONSTRAINTS:
     refinement is worse than the prior working draft.
   - Keep what is clearly working. This is a TARGETED improvement, not a redesign.
 
-WHERE TO ACTUALLY GET LIFT (pick the 1–2 most promising for this dataset, do them well):
-  - Feature engineering (tabular): domain-specific derived columns, group-aware
-    aggregates computed out-of-fold to avoid leakage, target/CatBoost-style encodings
-    for high-cardinality categoricals, interaction features between strong predictors.
-  - Hyperparameters (tabular): a small fixed-trial Optuna or grid search over
-    LightGBM/XGBoost params (num_leaves, learning_rate, min_child_samples,
-    feature_fraction, bagging_fraction, reg_alpha, reg_lambda). Cap trials to fit budget.
-  - Stacking: train a complementary base model (e.g., XGBoost if first was LightGBM,
-    or HistGradientBoosting), generate out-of-fold predictions for both, fit a small
-    Ridge/LogReg meta-learner on stacked OOF preds, predict test the same way.
-  - Image TTA: average the model's prediction on the original test image and its
-    horizontal flip. Cheap, almost always positive.
-  - Threshold calibration: when the schema demands hard labels (0/1 or class names),
-    sweep thresholds on out-of-fold predictions and pick the argmax of the official
-    metric, instead of using 0.5 / argmax-by-default.
-  - CV split: switch StratifiedKFold ↔ GroupKFold ONLY if you can identify a concrete
-    leakage risk (repeated entities, families, sessions). Do not raise fold count
-    blindly — it costs time without proportional gain.
+PICK EXACTLY ONE TACTIC for this refine pass — do it well, do not try to do all
+of them in one script:
 
-DO NOT regress: if you switch model families entirely, you must justify it in a single
-short comment at the top (e.g., "previous CV plateau at 0.81, switching to XGBoost+stack").
+  TACTIC A — HYPERPARAMETER SEARCH (tabular, when the model family is solid):
+    Wrap the existing model's training inside an Optuna study with a fixed trial
+    budget. Cap so total tuning time ≤ 30% of EXECUTION BUDGET. Suggested space:
+      LightGBM:  num_leaves [16,256], learning_rate [0.01,0.1] log, min_child_samples [5,100],
+                 feature_fraction [0.6,1.0], bagging_fraction [0.6,1.0], reg_alpha/lambda [1e-3,10] log.
+      XGBoost:   max_depth [4,10], learning_rate [0.01,0.1] log, min_child_weight [1,20],
+                 subsample [0.6,1.0], colsample_bytree [0.6,1.0], reg_alpha/lambda [1e-3,10] log.
+      CatBoost:  depth [4,10], learning_rate [0.01,0.1] log, l2_leaf_reg [1,10],
+                 random_strength [0.5,5], border_count [32,255].
+    Use the same CV split and OOF code as the prior draft. Score = the OOF metric.
+
+  TACTIC B — STACKING (when you already have ≥1 strong base model):
+    Add a complementary base model (LightGBM ↔ XGBoost ↔ CatBoost — pick the one
+    NOT used in the previous draft). Generate OOF predictions for BOTH base models.
+    Fit a small meta-learner (LogisticRegression for classification, Ridge for
+    regression) on the stacked [oof_a, oof_b] features. Predict test the same way:
+    average the per-fold test preds for each base, then meta-learner on the test
+    stacked preds.
+
+  TACTIC C — FEATURE ENGINEERING (tabular, when CV is stuck and the dataset
+  profile suggests untapped structure):
+    Add domain-derivable columns: out-of-fold target/CatBoost-style encodings for
+    high-cardinality cats, group-level aggregates (count, mean target, mean of
+    strong numeric features) using out-of-fold to avoid leakage, interaction
+    features between the top MI features, missing-value indicators, log/binning
+    transforms of skewed numeric columns.
+
+  TACTIC D — IMAGE TTA + CALIBRATION (image, when the backbone is already trained):
+    Average prediction on the original test image and its horizontal flip
+    (and vertical for non-natural images). For binary/multilabel with probability
+    submissions, this is ~free and positive. Add temperature scaling on a
+    held-out fold if calibration is the bottleneck.
+
+  TACTIC E — THRESHOLD CALIBRATION (hard-label submissions only):
+    Sweep thresholds on OOF predictions, pick the one that maximizes the official
+    metric. Do not use 0.5 / argmax by default.
+
+ALSO REQUIRED:
+  - Save OOF predictions to `os.environ.get('OOF_PATH')` if it is set (one row per
+    train sample in train.csv order, one column per prediction column). The
+    harness uses these for stacked ensembling across multiple drafts.
+  - Print "CV score: <number>" so we can compare against the previous draft.
+  - Keep the previous draft's CV split, target encoding, file handling. This is
+    a TARGETED improvement, not a redesign.
+
+DO NOT regress: do not switch the entire approach blindly. If the chosen tactic
+adds runtime cost, scale back something else (fewer Optuna trials, shrink the
+meta-learner CV fold count, etc.) so the total still fits the execution budget.
 """
+
+
+SYSTEM_PROMPT_REVIEW = """You are a senior Python engineer reviewing an ML script for an MLE-bench competition BEFORE it runs.
+
+Your job: spot critical bugs that would crash the script, produce an invalid submission, or leak labels — and output the fixed script. This is the cheapest place to catch a bug; a subprocess timeout costs us 15-30 minutes.
+
+CRITICAL BUG CATEGORIES (be aggressive — flag and fix):
+  1. CatBoost cat_features with NaN → categorical columns passed to CatBoost MUST be
+     `astype(str).where(notna,"missing")` (or fillna then astype(str)) BEFORE fit.
+     CatBoost throws "cat_features must be integer or string, real number values
+     and NaN values should be converted to string" otherwise.
+  2. LightGBM 4.x API misuse → `early_stopping_rounds=` or `verbose=` as fit() kwargs
+     is invalid; must use `callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)]`.
+  3. XGBoost categorical without `enable_categorical=True` when pandas `category` dtype
+     columns are passed.
+  4. CV leakage → target encodings, group aggregates, or stat-based features
+     computed on the FULL train set and merged into validation folds. Out-of-fold
+     computation is required for any target-conditional feature.
+  5. Submission schema mismatch → column names / order MUST match
+     sample_submission.csv exactly. NaN or non-finite values in prediction
+     columns will fail validation; clip / fillna BEFORE writing.
+  6. Boolean target encoded with string-key dict (`{"True":1,"False":0}`) when
+     the dataset profile shows the label dtype is bool. Use `astype(int)` instead.
+  7. Image dataloader: __getitem__ returning None on a bad sample → default
+     collate crashes. Either filter Nones in the Dataset or use a custom
+     collate_fn that drops None, or guarantee a tensor.
+  8. Writing to a path other than `os.environ['OUTPUT_PATH']`.
+  9. Missing `print("CV score: <number>")` — the harness parses this to compare
+     drafts. Must be present and numeric.
+  10. Hard-coded competition file names instead of using DATA_DIR-relative paths
+      from the dataset profile.
+
+OUTPUT CONTRACT — output exactly one of:
+  - The literal token `NO_ISSUES` (uppercase, alone) if the script has none of
+    the above bugs.
+  - The FULL repaired script inside a single ```python ... ``` block — no prose
+    before or after.
+
+Do NOT make stylistic changes, do NOT refactor, do NOT change the model or
+features unless they trigger one of the bug categories above. Minimum diff."""
 
 
 SYSTEM_PROMPT_REPAIR = """You are a senior Python engineer fixing a bug in an existing ML script.
@@ -297,15 +433,33 @@ class MLEBenchAgent:
         self.solutions_dir.mkdir(exist_ok=True)
         self.submissions_dir = workspace / "submissions"
         self.submissions_dir.mkdir(exist_ok=True)
+        # OOF predictions per draft. Coder is told (in prompts) to save OOF
+        # rows aligned to train.csv when OOF_PATH is set; the harness can use
+        # these later for stacked-meta ensembling. Today they're optional.
+        self.oofs_dir = workspace / "oofs"
+        self.oofs_dir.mkdir(exist_ok=True)
 
         self.max_iters = int(os.environ.get("MAX_DEBUG_ITERS", "5"))
-        self.subprocess_timeout = int(os.environ.get("SUBPROCESS_TIMEOUT_SEC", "1800"))
-        # Refinement iters can do TTA / larger backbones and need more headroom
-        # than the initial draft. Default 1.5× subprocess_timeout; override with
-        # REFINE_TIMEOUT_SEC. Ceiling 3600s — Quick Submit accepts ~4h total
-        # so any single iter under 1h is safe.
-        _refine_default = min(int(self.subprocess_timeout * 1.5), 3600)
+        # Total wall-clock budget for the whole run (planning + all iters +
+        # ensemble + finalize). Default 4h matches the empirical Quick Submit
+        # cap. Per-iter timeouts are derived dynamically from this so the
+        # first iter can use most of the budget if needed; later iters get
+        # whatever's left. SUBPROCESS_TIMEOUT_SEC and REFINE_TIMEOUT_SEC act
+        # as upper bounds (so a runaway iter can't eat the whole budget) but
+        # are ignored if remaining-budget is smaller.
+        self.total_budget = int(os.environ.get("TOTAL_BUDGET_SEC", "14400"))
+        self.subprocess_timeout = int(os.environ.get("SUBPROCESS_TIMEOUT_SEC", str(self.total_budget)))
+        _refine_default = min(int(self.subprocess_timeout * 1.5), self.total_budget)
         self.refine_timeout = int(os.environ.get("REFINE_TIMEOUT_SEC", str(_refine_default)))
+        # Reserve at end-of-budget for ensembling, schema validation, CSV
+        # write. If remaining < this, the loop stops and ships best so far.
+        self.finalize_reserve = int(os.environ.get("FINALIZE_RESERVE_SEC", "120"))
+        self._run_start: float | None = None
+        # Pre-execution self-review pass (LLM call between code-gen and subprocess).
+        # Catches CatBoost NaN-in-cat-features, LightGBM 4.x API misuse, CV
+        # leakage, schema mismatches, etc. Cheap insurance against a wasted
+        # 15-30 min subprocess. Default ON; SELF_REVIEW=0 disables.
+        self.self_review = os.environ.get("SELF_REVIEW", "1") != "0"
 
         self.description = self._read_text(data_dir / "description.md")
         self.sample_submission = self._read_text(data_dir / "sample_submission.csv", limit_lines=5)
@@ -943,7 +1097,7 @@ class MLEBenchAgent:
         user = (
             f"{history_block}"
             f"{diversity_block}"
-            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
+            f"EXECUTION BUDGET (seconds): {self._iter_budget_for_prompt()}\n\n"
             "PLAN (JSON):\n"
             f"{plan}\n\n"
             "COMPETITION DESCRIPTION (truncated):\n"
@@ -962,12 +1116,13 @@ class MLEBenchAgent:
             "and os.environ['OUTPUT_PATH'] for the submission CSV path."
         )
         text = openai_client.complete(SYSTEM_PROMPT_CODER, user, max_output_tokens=12000)
-        return self._extract_code(text)
+        code = self._extract_code(text)
+        return self._review_code(code, source="draft")
 
     def _refine_code(self, plan: str, best: StepResult) -> str:
         direction = "LOWER is better" if self.is_lower_better else "HIGHER is better"
         user = (
-            f"EXECUTION BUDGET (seconds): {self.refine_timeout}\n\n"
+            f"EXECUTION BUDGET (seconds): {self._iter_budget_for_prompt(refine=True)}\n\n"
             f"PLAN (JSON):\n{plan}\n\n"
             "COMPETITION DESCRIPTION (truncated):\n"
             f"{self.description[:6000]}\n\n"
@@ -983,11 +1138,63 @@ class MLEBenchAgent:
             "\"CV score: <number>\" so we can compare. Do not regress."
         )
         text = openai_client.complete(SYSTEM_PROMPT_REFINE, user, max_output_tokens=12000)
-        return self._extract_code(text)
+        code = self._extract_code(text)
+        return self._review_code(code, source="refine")
+
+    def _review_code(self, code: str, source: str) -> str:
+        """Cheap pre-execution review pass. Returns either the same code or a
+        patched version. Bounded to one LLM call. Disabled by SELF_REVIEW=0.
+
+        `source` describes which generator produced the code (draft / refine /
+        repair) and is included in the user prompt for context.
+        """
+        if not self.self_review:
+            return code
+        if not code or not code.strip():
+            return code
+        user = (
+            f"SOURCE: {source}\n"
+            "DATASET PROFILE (for schema / dtype context):\n"
+            f"{self.dataset_profile[:6000]}\n\n"
+            "SAMPLE SUBMISSION (first lines):\n"
+            f"{self.sample_submission}\n\n"
+            "SCRIPT TO REVIEW:\n"
+            f"```python\n{code}\n```\n\n"
+            "Output NO_ISSUES or the full repaired script. Nothing else."
+        )
+        try:
+            text = openai_client.complete(
+                SYSTEM_PROMPT_REVIEW, user, max_output_tokens=12000,
+            )
+        except Exception as e:
+            logger.warning("Self-review call failed (%s); using original code.", e)
+            return code
+        stripped = text.strip()
+        if not stripped:
+            logger.warning("Self-review returned empty output; using original code.")
+            return code
+        if stripped.upper().startswith("NO_ISSUES"):
+            logger.info("Self-review (%s): NO_ISSUES.", source)
+            return code
+        patched = self._extract_code(text)
+        if not patched.strip():
+            logger.warning(
+                "Self-review (%s) returned non-NO_ISSUES output but no code "
+                "block; using original code.", source,
+            )
+            return code
+        if patched.strip() == code.strip():
+            logger.info("Self-review (%s): no effective changes.", source)
+            return code
+        logger.info(
+            "Self-review (%s): applied patch (%d → %d chars).",
+            source, len(code), len(patched),
+        )
+        return patched
 
     def _repair_code(self, last: StepResult) -> str:
         user = (
-            f"EXECUTION BUDGET (seconds): {self.subprocess_timeout}\n\n"
+            f"EXECUTION BUDGET (seconds): {self._iter_budget_for_prompt()}\n\n"
             "DATA DIR LISTING:\n"
             f"{self.data_listing}\n\n"
             "STRUCTURED DATASET PROFILE:\n"
@@ -1005,7 +1212,8 @@ class MLEBenchAgent:
             "Output the repaired full solution.py. Minimum diff. Keep the overall approach."
         )
         text = openai_client.complete(SYSTEM_PROMPT_REPAIR, user, max_output_tokens=12000)
-        return self._extract_code(text)
+        code = self._extract_code(text)
+        return self._review_code(code, source="repair")
 
     @staticmethod
     def _classify_failure(result: StepResult) -> str:
@@ -1030,6 +1238,7 @@ class MLEBenchAgent:
         env = os.environ.copy()
         env["DATA_DIR"] = str(self.data_dir)
         env["OUTPUT_PATH"] = str(output_path)
+        env["OOF_PATH"] = str(self.oofs_dir / f"oof_{iter_idx}.csv")
         # Avoid the script trying to use a GPU it doesn't have.
         env.setdefault("CUDA_VISIBLE_DEVICES", "")
 
@@ -1105,17 +1314,54 @@ class MLEBenchAgent:
 
     # -------------------------------------------------------------------- run
 
+    def _remaining_budget(self) -> int:
+        """Seconds remaining in the total wall-clock budget."""
+        if self._run_start is None:
+            return self.total_budget
+        elapsed = time.monotonic() - self._run_start
+        return max(0, int(self.total_budget - elapsed - self.finalize_reserve))
+
+    def _iter_budget_for_prompt(self, *, refine: bool = False) -> int:
+        """Budget number to show the LLM in EXECUTION BUDGET. Tighter of the
+        configured per-iter cap and the wall-clock remaining."""
+        cap = self.refine_timeout if refine else self.subprocess_timeout
+        return min(cap, self._remaining_budget())
+
     def run(self) -> Path:
+        self._run_start = time.monotonic()
         plan = self._make_plan()
         self.is_lower_better = self._plan_is_lower_better(plan)
         target_n = self._self_consistency_target(plan)
-        logger.info("Self-consistency target: %d valid drafts", target_n)
+        strategy = self._iteration_strategy(plan)
+        do_refine = strategy["do_refine"]
+        do_ensemble = strategy["do_ensemble"]
+        # Planner-decided cap on total iterations: enough drafts + (maybe) one
+        # refine. Bounded by MAX_DEBUG_ITERS as a safety ceiling.
+        planner_max_iters = target_n + (1 if do_refine else 0)
+        effective_max = min(self.max_iters, max(1, planner_max_iters))
+        logger.info(
+            "Self-consistency target: %d valid drafts | do_refine=%s do_ensemble=%s | iters_cap=%d | total_budget=%ds remaining=%ds",
+            target_n, do_refine, do_ensemble, effective_max,
+            self.total_budget, self._remaining_budget(),
+        )
 
         history: list[StepResult] = []
         valid: list[tuple[StepResult, Path]] = []
 
-        for i in range(self.max_iters):
-            logger.info("=== iteration %d/%d ===", i + 1, self.max_iters)
+        for i in range(effective_max):
+            remaining = self._remaining_budget()
+            # Need at least ~3 minutes to attempt another iter (LLM call +
+            # minimal subprocess). Otherwise stop and ship best so far.
+            if remaining < 180:
+                logger.info(
+                    "Total budget nearly exhausted (remaining=%ds); stopping loop early.",
+                    remaining,
+                )
+                break
+            logger.info(
+                "=== iteration %d/%d (remaining_budget=%ds) ===",
+                i + 1, effective_max, remaining,
+            )
             category = self._classify_failure(history[-1]) if history else None
             if category is not None:
                 logger.info("Previous iter classified as: %s", category)
@@ -1126,30 +1372,41 @@ class MLEBenchAgent:
             elif category == "ok" and len(valid) < target_n:
                 successful = [r for r, _ in valid]
                 code = self._draft_code(plan, history, diverse_from=successful)
-            elif category == "ok" and len(valid) >= target_n:
+            elif category == "ok" and len(valid) >= target_n and do_refine:
                 # Exploration target reached — exploit remaining iters by refining
                 # the current best valid draft.
                 best_result, _ = valid[
                     max(range(len(valid)), key=lambda j: self._cv_score_for_sort(valid[j][0]))
                 ]
                 logger.info(
-                    "Refinement pass: improving best draft (cv=%s, timeout=%ds)",
-                    best_result.cv_score, self.refine_timeout,
+                    "Refinement pass: improving best draft (cv=%s)",
+                    best_result.cv_score,
                 )
                 code = self._refine_code(plan, best_result)
                 is_refine = True
+            elif category == "ok" and len(valid) >= target_n and not do_refine:
+                logger.info("Planner disabled refinement; stopping draft loop.")
+                break
             else:
                 # initial draft, or full rewrite after timeout
                 code = self._draft_code(plan, history)
 
-            iter_timeout = self.refine_timeout if is_refine else self.subprocess_timeout
+            # Per-iter timeout = min(its configured cap, remaining wall budget
+            # minus a small reserve). The cap prevents one runaway iter from
+            # eating the whole budget when later iters could also be useful.
+            cap = self.refine_timeout if is_refine else self.subprocess_timeout
+            iter_timeout = min(cap, max(60, self._remaining_budget()))
+            logger.info(
+                "Iter %d timeout=%ds (cap=%ds, remaining=%ds)",
+                i, iter_timeout, cap, self._remaining_budget(),
+            )
             result = self._execute(code, i, timeout=iter_timeout)
             history.append(result)
             sub_path = self.submissions_dir / f"submission_{i}.csv"
             if result.submission_ok and result.returncode == 0:
                 valid.append((result, sub_path))
 
-        ens_pool = self._filter_for_ensemble(valid)
+        ens_pool = self._filter_for_ensemble(valid) if do_ensemble else []
         if len(ens_pool) >= 2:
             ens_path = self._ensemble(ens_pool)
             if ens_path is not None:
@@ -1192,21 +1449,37 @@ class MLEBenchAgent:
                 return max(1, int(override))
             except ValueError:
                 pass
+        # Honor the planner's iteration_strategy if present.
+        try:
+            strat = json.loads(plan).get("iteration_strategy") or {}
+            n = int(strat.get("n_drafts"))
+            if 1 <= n <= 3:
+                return n
+        except Exception:
+            pass
         try:
             modality = json.loads(plan).get("modality", "other")
         except Exception:
             modality = "other"
-        # Per-modality defaults: cheaper modalities get more drafts.
-        # Tabular target lowered to 2 (from 4) on 2026-05-03 — at gpt-5-mini's
-        # observed 20-40% diverse-draft success rate, target=4 never lets the
-        # refinement branch fire within MAX_DEBUG_ITERS=5. With target=2 the
-        # remaining iters can refine the best valid draft.
-        # Image bumped 1 → 2 on 2026-05-03 after the actual Quick Submit cap
-        # was found to be ~4h (not 30 min): two image drafts now fit
-        # comfortably, and we observed cases where iter 0 (planner's expected-
-        # best, e.g. supervised CNN) underperformed a tuned classical baseline
-        # on CPU. A second draft on a different model family catches that.
+        # Per-modality defaults when planner did not emit iteration_strategy.
         return {"tabular": 2, "text": 2, "image": 2}.get(modality, 1)
+
+    def _iteration_strategy(self, plan: str) -> dict:
+        """Parse iteration_strategy from plan with safe defaults."""
+        defaults = {"n_drafts": None, "do_refine": True, "do_ensemble": True}
+        try:
+            strat = json.loads(plan).get("iteration_strategy") or {}
+        except Exception:
+            return defaults
+        out = dict(defaults)
+        if isinstance(strat.get("do_refine"), bool):
+            out["do_refine"] = strat["do_refine"]
+        if isinstance(strat.get("do_ensemble"), bool):
+            out["do_ensemble"] = strat["do_ensemble"]
+        n = strat.get("n_drafts")
+        if isinstance(n, int) and 1 <= n <= 3:
+            out["n_drafts"] = n
+        return out
 
     def _cv_score_for_sort(self, r: StepResult) -> float:
         if r.cv_score is None:

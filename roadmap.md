@@ -219,6 +219,71 @@ For multi-comp eval: `scripts/run_eval_quick.sh` (spaceship + cactus, ~25 min).
 
 ## Changelog
 
+### 2026-05-03 — planner-ping diagnostic + adaptive iteration plan
+
+Investigation triggered by gpt-5 high-effort regression on spaceship-titanic
+(0.81839 → 0.80115, 50th → 117th). Built diagnostic improvements and tested
+v2 on a smoke run, then attempted long-runs on denoising + jigsaw.
+
+**v2 changes shipped (`src/agent.py`, `requirements.txt`):**
+- Added `catboost` + `optuna` to deps + AVAILABLE LIBRARIES.
+- TABULAR section: explicit CatBoost NaN-in-cat-features footgun, XGBoost
+  `enable_categorical`, OOF-save directive, Optuna budget cap.
+- `SYSTEM_PROMPT_DIVERSITY_DIRECTIVE`: explicit per-modality rotation order
+  (Tabular: LGBM → CatBoost → XGBoost → HistGB. Text: TF-IDF+LR → +LinearSVC →
+  +SGD. Image: timm backbone → different same-size backbone). Inline CatBoost
+  snippet with NaN handling.
+- `SYSTEM_PROMPT_REFINE`: replaced "WHERE TO ACTUALLY GET LIFT" with 5
+  concrete TACTICS (Optuna HP, OOF stacking, FE, Image TTA, threshold tuning).
+- New `SYSTEM_PROMPT_REVIEW` + `_review_code` method: bounded LLM call before
+  every execute (draft / refine / repair). 10 critical bug categories
+  (CatBoost NaN, LGBM 4.x API, XGB enable_categorical, CV leakage, schema
+  mismatch, bool dict, dataloader None, OUTPUT_PATH, CV print, hardcoded
+  paths). Output contract: `NO_ISSUES` or full repaired Python block. Gated
+  by `SELF_REVIEW=1` env (default on).
+- `OOF_PATH` env var wired in `_execute` (one CSV per iteration in
+  `oofs_dir`). Stacking meta-learner not yet implemented.
+
+**v2 smoke validation (spaceship-titanic, gpt-5-mini):**
+| Iter | CV | Notes |
+|---|---|---|
+| 0 (LGBM) | 0.807 | self-review patched draft (14965→15392 chars) |
+| 1 (CatBoost/XGB) | 0.814 | refine no longer crashes on NaN-in-cat |
+| 2 (refine) | 0.812 | self-review patched (15938→16122) |
+
+Ensemble of 3 vs baseline ensemble of 2. End-to-end loop now resilient.
+
+**Long-run attempt 1 (denoising + jigsaw, gpt-5-mini, parallel):**
+- denoising: `MAX_DEBUG_ITERS=4 SUBPROCESS_TIMEOUT_SEC=1800 REFINE_TIMEOUT_SEC=2700`
+- jigsaw:    `MAX_DEBUG_ITERS=4 SUBPROCESS_TIMEOUT_SEC=1500 REFINE_TIMEOUT_SEC=2100`
+
+Both iter 0 timed out: `rc=-2 ok=False cv=None err=submission CSV was not created`.
+- Denoising: U-Net training + sliding-window inference on 144 train + 72 test
+  exceeded 1800s on CPU.
+- Jigsaw: TF-IDF (word 1-3 + char 3-6) + 6×OvR LogReg with 5-fold CV on 159k
+  rows exceeded 1500s.
+
+Killed both, archived logs as `*.log.run1`. Lesson: subprocess timeouts must
+match what the planner actually estimates (planner said 20-45 min for jigsaw,
+we gave 25). Planner-ping diagnostic confirmed gpt-5-mini picks the right
+families (TF-IDF + per-label LR for jigsaw; small U-Net for denoising) — the
+planner is not the bottleneck. The bottleneck is fixed iteration budget +
+no adaptive strategy.
+
+**Next changes (in flight):**
+- (A) Add `iteration_strategy` to planner JSON: `n_drafts` (1-3), `do_refine`,
+  `do_ensemble`, `rationale`. Loop honors planner's call instead of always
+  burning `MAX_DEBUG_ITERS`. When `model_plan[0]` is a strong well-known
+  recipe likely correct first try, planner sets `n_drafts=1` and saves
+  iters / API spend.
+- (C) Coder prompt tightened: must NOT exceed `EXECUTION BUDGET`. If
+  `model_plan[0]`'s estimate exceeds budget, pick a leaner version of the
+  same approach.
+
+`scripts/planner_ping.py` added: stub-input diagnostic that runs only
+`_make_plan` against a comp dir, no execution. Used to validate planner
+output without burning subprocess time.
+
 ### 2026-05-03 — high-budget denoising re-test + bug fixes
 Two runs on `denoising-dirty-documents` with the new high-budget defaults
 (`MAX_DEBUG_ITERS=4`, `SUBPROCESS_TIMEOUT_SEC=1800`,
