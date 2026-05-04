@@ -219,6 +219,59 @@ For multi-comp eval: `scripts/run_eval_quick.sh` (spaceship + cactus, ~25 min).
 
 ## Changelog
 
+### 2026-05-04 — silent-failure submission + hardening fixes
+
+Two real submissions failed catastrophically. Root cause and fixes shipped.
+
+**What happened:**
+- Jigsaw run: scored **0.5 AUC** (chance-level — fell back to
+  `sample_submission.csv` after iter 0 produced nothing).
+- Denoising run: **`Status: failed — Agent did not submit a valid
+  submission.csv`** (no submission produced after 3 iters).
+
+**Root cause (forensics from run logs):**
+1. Quick Submit config did not pass `openai_model`. Manifest's
+   `OPENAI_MODEL: { when: "config.openai_model", value: "..." }` only sets
+   the env IF the user supplied it; otherwise `openai_client.complete`
+   defaulted to `gpt-5-mini`. Both real runs ran the wrong model.
+2. Across all iters of both runs, the subprocess "completed" in
+   **11–13 ms** with `rc=0` and no submission CSV. Impossible for any real
+   Python startup (cold start is ~30 ms minimum). Diagnosis: gpt-5-mini
+   under our prompt was emitting prose / partial output without a
+   ```python``` code block. `_extract_code` fell through to its raw-text
+   return path, wrote markdown to `solution_*.py`, Python evaluated it
+   trivially and exited clean.
+3. Self-review pass never fired (no `Self-review (...)` log lines). The
+   silent branch in `_review_code` is `if not code or not code.strip():
+   return code` — an empty `code` from `_extract_code` skipped review with
+   no log, so the silent failure had no in-process check.
+4. With every iter producing nothing, the loop fell through to either the
+   `sample_submission.csv` fallback (jigsaw, scored 0.5) or no submission
+   at all (denoising, ran out of iters before a fallback path was
+   reachable, since iter pool was empty).
+
+**Fixes shipped (this commit):**
+- `src/agent.py` `_extract_code` — never returns raw markdown. Returns
+  fenced code if present (```python``` or bare ```), otherwise empty
+  string. Also recognizes bare ``` fences whose contents contain
+  python-shape tokens (`import`, `def`, `class`, `from`).
+- `src/agent.py` `_execute` — short-circuits on empty/whitespace code with
+  `rc=-4` and a clear stderr message. `_classify_failure` already routes
+  any `rc != 0 / != -2` to `execution_bug`, so the next iter runs the
+  repair flow instead of silently re-executing nothing.
+- `src/openai_client.py` — default model `gpt-5-mini` → `gpt-5.4` so an
+  unset `openai_model` config doesn't silently downgrade.
+- `src/server.py` — agent-card name uses `os.environ.get('OPENAI_MODEL',
+  'gpt-5.4')` instead of hardcoded "gpt-5-mini" string. Logs now reflect
+  what's actually running.
+
+**Submission steps:**
+1. Push → publish workflow rebuilds image to GHCR.
+2. Update `amber-manifest.json5` with new `@sha256:` digest from the
+   workflow job summary.
+3. Resubmit. With these defaults, even an empty config JSON (just
+   `openai_api_key`) ships gpt-5.4 + total_budget=14400.
+
 ### 2026-05-03 — planner-ping diagnostic + adaptive iteration plan
 
 Investigation triggered by gpt-5 high-effort regression on spaceship-titanic

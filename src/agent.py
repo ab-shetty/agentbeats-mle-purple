@@ -1043,7 +1043,7 @@ class MLEBenchAgent:
         # 2000 tokens of visible output was tight when reasoning_effort=high
         # (reasoning ate the budget and the planner returned empty). 6000 is
         # comfortable for both effort=medium and effort=high.
-        plan_text = openai_client.complete(SYSTEM_PROMPT_PLANNER, user, max_output_tokens=6000)
+        plan_text = openai_client.complete(SYSTEM_PROMPT_PLANNER, user, max_output_tokens=32000)
         # Try to validate JSON; fall back to raw text if it doesn't parse.
         try:
             json.loads(plan_text)
@@ -1125,7 +1125,7 @@ class MLEBenchAgent:
             "Write a complete solution.py. Use os.environ['DATA_DIR'] for the data dir "
             "and os.environ['OUTPUT_PATH'] for the submission CSV path."
         )
-        text = openai_client.complete(SYSTEM_PROMPT_CODER, user, max_output_tokens=12000)
+        text = openai_client.complete(SYSTEM_PROMPT_CODER, user, max_output_tokens=80000)
         code = self._extract_code(text)
         return self._review_code(code, source="draft")
 
@@ -1147,7 +1147,7 @@ class MLEBenchAgent:
             "Improve this solution. Keep the submission schema valid. Print "
             "\"CV score: <number>\" so we can compare. Do not regress."
         )
-        text = openai_client.complete(SYSTEM_PROMPT_REFINE, user, max_output_tokens=12000)
+        text = openai_client.complete(SYSTEM_PROMPT_REFINE, user, max_output_tokens=80000)
         code = self._extract_code(text)
         return self._review_code(code, source="refine")
 
@@ -1174,7 +1174,7 @@ class MLEBenchAgent:
         )
         try:
             text = openai_client.complete(
-                SYSTEM_PROMPT_REVIEW, user, max_output_tokens=12000,
+                SYSTEM_PROMPT_REVIEW, user, max_output_tokens=80000,
             )
         except Exception as e:
             logger.warning("Self-review call failed (%s); using original code.", e)
@@ -1221,7 +1221,7 @@ class MLEBenchAgent:
             f"{last.submission_error or '(none)'}\n\n"
             "Output the repaired full solution.py. Minimum diff. Keep the overall approach."
         )
-        text = openai_client.complete(SYSTEM_PROMPT_REPAIR, user, max_output_tokens=12000)
+        text = openai_client.complete(SYSTEM_PROMPT_REPAIR, user, max_output_tokens=80000)
         code = self._extract_code(text)
         return self._review_code(code, source="repair")
 
@@ -1370,10 +1370,12 @@ class MLEBenchAgent:
         strategy = self._iteration_strategy(plan)
         do_refine = strategy["do_refine"]
         do_ensemble = strategy["do_ensemble"]
-        # Planner-decided cap on total iterations: enough drafts + (maybe) one
-        # refine. Bounded by MAX_DEBUG_ITERS as a safety ceiling.
-        planner_max_iters = target_n + (1 if do_refine else 0)
-        effective_max = min(self.max_iters, max(1, planner_max_iters))
+        # Loop budget = MAX_DEBUG_ITERS (default 5). target_n / do_refine drive
+        # early-stop, NOT loop length — otherwise n_drafts=1 + iter-0 failure
+        # = no retries (we hit this on jigsaw 2026-05-04). The loop exits early
+        # when target_n valid drafts are collected and refine is done (or
+        # disabled), via explicit break statements below.
+        effective_max = self.max_iters
         logger.info(
             "Self-consistency target: %d valid drafts | do_refine=%s do_ensemble=%s | iters_cap=%d | total_budget=%ds remaining=%ds",
             target_n, do_refine, do_ensemble, effective_max,
